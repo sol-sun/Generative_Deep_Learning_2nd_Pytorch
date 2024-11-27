@@ -1,7 +1,6 @@
 # Generative Deep Learning 第二版 PyTorch 実装
 
 本リポジトリは，David Foster著「Generative Deep Learning」第二版の内容を **PyTorch** で実装したものです．
-オリジナルの実装はTensorFlowで行われていますが，PyTorchによる実装を行いました．
 
 ## 📖 目次
 
