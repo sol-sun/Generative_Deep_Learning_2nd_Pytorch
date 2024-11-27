@@ -34,8 +34,7 @@
 
 各章に対応するディレクトリに、章の内容を実装したPyTorchコードと解説が含まれています．
 
-
-📚 参考文献
+## 📚 参考文献
 
 - 	[原著書籍: Generative Deep Learning, 2nd Edition](https://www.amazon.co.jp/dp/4814400756)
 - 	[オリジナルリポジトリ: Generative Deep Learning](https://github.com/davidADSP/Generative_Deep_Learning_2nd_Edition/)
