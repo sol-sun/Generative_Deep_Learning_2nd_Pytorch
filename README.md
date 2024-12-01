@@ -35,5 +35,5 @@
 
 ## 📚 参考文献
 
-- 	[生成 Deep Learning 第2版]([https://www.amazon.co.jp/dp/4814400756](https://www.amazon.co.jp/dp/4814400756)
+- 	[生成 Deep Learning 第2版](https://www.amazon.co.jp/dp/4814400756)
 - 	[オリジナルリポジトリ: Generative Deep Learning](https://github.com/davidADSP/Generative_Deep_Learning_2nd_Edition/)
