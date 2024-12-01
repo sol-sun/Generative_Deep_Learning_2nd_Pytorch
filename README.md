@@ -1,4 +1,4 @@
-# Generative Deep Learning 第二版 PyTorch 実装
+# 生成 Deep Learning 第二版 PyTorch 実装
 
 本リポジトリは，David Foster著「Generative Deep Learning」第二版の内容を **PyTorch** で実装したものです．
 
@@ -35,5 +35,5 @@
 
 ## 📚 参考文献
 
-- 	[原著書籍: Generative Deep Learning, 2nd Edition](https://www.amazon.co.jp/dp/4814400756)
+- 	[生成 Deep Learning 第2版]([https://www.amazon.co.jp/dp/4814400756](https://www.amazon.co.jp/dp/4814400756)
 - 	[オリジナルリポジトリ: Generative Deep Learning](https://github.com/davidADSP/Generative_Deep_Learning_2nd_Edition/)
