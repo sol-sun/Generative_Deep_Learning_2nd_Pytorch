@@ -110,7 +110,7 @@ class FactSetIdentityRecord(BaseModel):
         description="FactSet Entity ID",
         examples=["001C7F-E"]
     )
-    company_name: Optional[constr(min_length=1, max_length=255)] = Field(
+    company_name: Optional[constr(min_length=1, max_length=512)] = Field(
         default=None,
         description="企業名",
         examples=["Apple Inc."]
@@ -505,6 +505,18 @@ class FactSetQueryParams(BaseModel):
         examples=[202412]
     )
     
+    @field_validator('period_range', mode='before')
+    @classmethod
+    def validate_period_range(cls, v):
+        """WolfPeriodRangeの適切な処理を確保します。"""
+        if v is None:
+            return v
+        # 既にWolfPeriodRangeインスタンスの場合はそのまま返す
+        if isinstance(v, WolfPeriodRange):
+            return v
+        # その他の変換処理は既存のWolfPeriodRangeの機能に委ねる
+        return v
+
     # 地域フィルタ（パフォーマンス最適化）
     country_codes: Optional[List[constr(pattern=r"^[A-Z]{2}$")]] = Field(
         default=None,
@@ -516,10 +528,6 @@ class FactSetQueryParams(BaseModel):
     batch_size: conint(ge=1, le=10000) = Field(
         default=1000,
         description="バッチサイズ（大量データ処理用）"
-    )
-    max_records: Optional[conint(ge=1, le=1000000)] = Field(
-        default=None,
-        description="最大レコード数制限"
     )
     
     @field_validator("country_codes", mode="before")
@@ -661,7 +669,7 @@ class FactSetProvider(DataProcessor):
                 - active_only: アクティブな証券のみ
                 - include_primary_equity_only: 主力証券のみ
                 - fsym_ids: FSYM ID（単一または配列）
-                - max_records, batch_size: パフォーマンス制御
+                - batch_size: パフォーマンス制御
 
         Returns:
             取得・正規化済みの `FactSetIdentityRecord` リスト。
@@ -708,7 +716,7 @@ class FactSetProvider(DataProcessor):
                 - country / countries: 国コード（単一または配列）
                 - fsym_ids: FSYM ID（単一または配列）
                 - exclude_zero_sales, max_fterm
-                - max_records, batch_size
+                - batch_size
 
         Returns:
             取得・整形・計算済みの `FactSetFinancialRecord` リスト。
@@ -720,9 +728,8 @@ class FactSetProvider(DataProcessor):
         params = self._normalize_query_params(params, kwargs)
         
         logger.info(
-            "FactSet財務データ取得開始: period_range=%s max_records=%s batch_size=%d",
+            "FactSet財務データ取得開始: period_range=%s batch_size=%d",
             params.period_range,
-            params.max_records,
             params.batch_size
         )
         
@@ -822,7 +829,6 @@ class FactSetProvider(DataProcessor):
         ORDER BY
             sec.factset_entity_id,
             sec.fsym_id
-        {f"LIMIT {params.max_records}" if params.max_records else ""}
         """
         
         # パラメータ準備
@@ -905,13 +911,13 @@ class FactSetProvider(DataProcessor):
             BAS.FF_INC_TAX, 
             BAS.FF_EQ_AFF_INC, 
             BAS_D.FF_EBIT_OPER,
+            BAS_D.FF_MKT_VAL,
             ADV_D.FF_ROIC,
-            ADV_D.FF_MKT_VAL,
             BAS.FF_PRICE_CLOSE_FP,
             BAS.FF_COM_SHS_OUT,
             BAS.FF_DEBT,
-            ADV.FF_DEBT_LT,
-            ADV.FF_DEBT_ST,
+            BAS.FF_DEBT_LT,
+            BAS.FF_DEBT_ST,
             ADV_D.FF_TAX_RATE,
             ADV_D.FF_EFF_INT_RATE,
             BAS.FF_INT_EXP_TOT,
@@ -941,14 +947,12 @@ class FactSetProvider(DataProcessor):
             END = AF.FISCAL_YEAR
         WHERE {where_clause}
         ORDER BY BAS.FSYM_ID, BAS.DATE
-        {f"LIMIT {params.max_records}" if params.max_records else ""}
         """
         
         logger.debug("FactSet財務データクエリ実行: params=%s", sql_params)
         df = self.db.execute_query(sql, params=sql_params)
         return self._compute_financial_metrics(df, params)
     
-    @lru_cache(maxsize=1000)
     def _compute_financial_metrics(self, df: pd.DataFrame, params: FactSetQueryParams) -> pd.DataFrame:
         """財務指標の派生計算をベクトル化して適用します。
 
@@ -1105,10 +1109,25 @@ class FactSetProvider(DataProcessor):
                     batch_records.append(record)
                 except Exception as e:
                     validation_errors += 1
+                    # 詳細な識別子情報を含むエラーログ
+                    identifier_info = {
+                        "FSYM_ID": row.get("FSYM_ID"),
+                        "ENTITY_ID": row.get("FACTSET_ENTITY_ID"),
+                        "ISIN": row.get("ISIN"),
+                        "CUSIP": row.get("CUSIP"),
+                        "SEDOL": row.get("SEDOL"),
+                        "TICKER": row.get("TICKER"),
+                        "TICKER_REGION": row.get("TICKER_REGION"),
+                        "COMPANY_NAME": row.get("COMPANY_NAME"),
+                        "HQ_COUNTRY": row.get("HEADQUARTERS_COUNTRY_CODE"),
+                        "EXCHANGE_COUNTRY": row.get("EXCHANGE_COUNTRY_CODE")
+                    }
+                    # None値を除外してログを見やすくする
+                    filtered_info = {k: v for k, v in identifier_info.items() if v is not None and v != ""}
+                    
                     logger.debug(
-                        "FactSet識別子レコード検証エラー: fsym_id=%s entity_id=%s error=%s",
-                        row.get("FSYM_ID"),
-                        row.get("FACTSET_ENTITY_ID"),
+                        "FactSet識別子レコード検証エラー: identifiers=%s error=%s",
+                        filtered_info,
                         str(e)
                     )
             
@@ -1196,10 +1215,26 @@ class FactSetProvider(DataProcessor):
                     batch_records.append(record)
                 except Exception as e:
                     validation_errors += 1
+                    # 詳細な財務データ情報を含むエラーログ
+                    financial_info = {
+                        "FSYM_ID": row.get("FSYM_ID"),
+                        "DATE": str(row.get("DATE")),
+                        "CURRENCY": row.get("CURRENCY"),
+                        "FF_SALES": row.get("FF_SALES"),
+                        "FF_OPER_INC": row.get("FF_OPER_INC"),
+                        "FF_NET_INC": row.get("FF_NET_INC"),
+                        "FF_ASSETS": row.get("FF_ASSETS"),
+                        "FF_DEBT": row.get("FF_DEBT"),
+                        "FF_MKT_VAL": row.get("FF_MKT_VAL"),
+                        "FTERM_2": row.get("FTERM_2"),
+                        "REGION": row.get("REGION")
+                    }
+                    # None値を除外してログを見やすくする
+                    filtered_info = {k: v for k, v in financial_info.items() if v is not None and v != ""}
+                    
                     logger.debug(
-                        "FactSet財務レコード検証エラー: fsym_id=%s date=%s error=%s",
-                        row.get("FSYM_ID"),
-                        row.get("DATE"),
+                        "FactSet財務レコード検証エラー: financial_data=%s error=%s",
+                        filtered_info,
                         str(e)
                     )
             
