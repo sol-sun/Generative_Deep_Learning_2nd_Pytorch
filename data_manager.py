@@ -4,16 +4,23 @@ FactSetデータマネージャー
 各種データプロバイダーを統合し、セグメントマッピング処理を実行
 """
 
-from typing import Dict
+from typing import Dict, Optional, List
 import pandas as pd
 import numpy as np
 import warnings
+from datetime import datetime, timezone, date
+
 from gppm.providers.factset_provider import FactSetProvider
 from gppm.providers.segment_data_provider import SegmentDataProvider
 from gppm.providers.revere_data_provider import RevereDataProvider
 from gppm.providers.rbics_provider import RBICSProvider
+from gppm.providers.rbics_types import RBICSQueryParams, RBICSStructureRecord
 from gppm.finance.geographic_processor import GeographicProcessor
 from gppm.utils.data_processor import DataProcessor
+from gppm.utils.config_manager import get_logger
+from wolf_period import WolfPeriod
+
+logger = get_logger(__name__)
 
 
 class FactSetDataManager:
@@ -51,7 +58,7 @@ class FactSetDataManager:
         financial_data = self._get_financial_data()
         segment_data = self.segment_provider.get_segment_data()
         revere_data = self.revere_provider.get_revere_data()
-        rbics_master = self.rbics_provider.get_master_table()
+        rbics_master = self.get_rbics_master_dataframe()
         
         print(f"企業データ: {len(entity_data)} 件")
         print(f"財務データ: {len(financial_data)} 件")
@@ -115,6 +122,84 @@ class FactSetDataManager:
         )
         
         return entity_data
+    
+    def get_rbics_master_dataframe(self) -> pd.DataFrame:
+        """
+        RBICSマスターデータをDataFrame形式で取得
+        
+        Returns:
+            RBICS構造マスターデータのDataFrame
+            
+        Raises:
+            RuntimeError: データ取得エラーの場合
+        """
+        try:
+            # 現在の日付でクエリパラメータを作成
+            current_date = datetime.now(timezone.utc).date()
+            query_params = RBICSQueryParams(
+                period=WolfPeriod.from_day(current_date)
+            )
+            
+            # 内部メソッドを使用してDataFrame形式で取得
+            rbics_df = self.rbics_provider._query_structure_data(query_params)
+            
+            if rbics_df.empty:
+                logger.warning("RBICSマスターデータが空です")
+                return pd.DataFrame()
+            
+            # カラム名を統一（既存コードとの互換性のため）
+            column_mapping = {
+                'L1_ID': 'L1_ID', 'L2_ID': 'L2_ID', 'L3_ID': 'L3_ID', 
+                'L4_ID': 'L4_ID', 'L5_ID': 'L5_ID', 'L6_ID': 'L6_ID',
+                'L1_NAME': 'L1_NAME', 'L2_NAME': 'L2_NAME', 'L3_NAME': 'L3_NAME',
+                'L4_NAME': 'L4_NAME', 'L5_NAME': 'L5_NAME', 'L6_NAME': 'L6_NAME',
+                'SECTOR_DESC': 'L6_DESCR'
+            }
+            
+            # 必要な列のみを選択してリネーム
+            available_cols = [col for col in column_mapping.keys() if col in rbics_df.columns]
+            rbics_df = rbics_df[available_cols].rename(columns={
+                k: v for k, v in column_mapping.items() if k in available_cols
+            })
+            
+            logger.info(f"RBICSマスターデータを取得: {len(rbics_df)} 件")
+            return rbics_df
+            
+        except Exception as e:
+            logger.error(f"RBICSマスターデータ取得エラー: {e}")
+            raise RuntimeError(f"RBICSマスターデータの取得に失敗しました: {e}") from e
+    
+    def get_rbics_structure_records(self, 
+                                   period: Optional[WolfPeriod] = None,
+                                   **kwargs) -> List[RBICSStructureRecord]:
+        """
+        RBICS構造マスターレコードを取得（レコード形式）
+        
+        Args:
+            period: 取得対象期間（省略時は現在日付）
+            **kwargs: その他のクエリパラメータ
+            
+        Returns:
+            RBICS構造マスターレコードのリスト
+            
+        Raises:
+            RuntimeError: データ取得エラーの場合
+        """
+        try:
+            if period is None:
+                period = WolfPeriod.from_day(datetime.now(timezone.utc).date())
+            
+            records = self.rbics_provider.get_structure_records(
+                period=period, 
+                **kwargs
+            )
+            
+            logger.info(f"RBICS構造マスターレコードを取得: {len(records)} 件")
+            return records
+            
+        except Exception as e:
+            logger.error(f"RBICS構造マスターレコード取得エラー: {e}")
+            raise RuntimeError(f"RBICS構造マスターレコードの取得に失敗しました: {e}") from e
     
     def _create_segment_variations(self, segment_data: pd.DataFrame) -> pd.DataFrame:
         """seg_af2とseg_af3を作成（オリジナルコードのseg_af2, seg_af3と同等）"""
@@ -358,14 +443,23 @@ class FactSetDataManager:
         self._add_calculated_financial_columns(df)
         
         # 地域マッピング
-        currencies = df["CURRENCY"].unique()
-        region_df = self.geo_processor.get_region_mapping(currencies)
-        df = df.merge(region_df, on=["CURRENCY"], how="left")
+        try:
+            currencies = df["CURRENCY"].unique()
+            region_df = self.geo_processor.get_region_mapping(currencies)
+            df = df.merge(region_df, on=["CURRENCY"], how="left")
+        except Exception as e:
+            logger.warning(f"地域マッピングでエラーが発生しました: {e}")
+            # 地域マッピングは必須ではないため、処理を続行
         
         return df
     
     def _add_calculated_financial_columns(self, df: pd.DataFrame) -> None:
-        """計算済み財務列を追加（元のコードと同じ計算ロジック）"""
+        """
+        計算済み財務列を追加（元のコードと同じ計算ロジック）
+        
+        Args:
+            df: 財務データのDataFrame（インプレース更新）
+        """
         # パーセント値を小数点形式に変換
         if 'FF_ROIC' in df.columns:
             df["FF_ROIC"] /= 100
@@ -392,16 +486,27 @@ class FactSetDataManager:
             df = self._fill_debt_interest_quarterly(df)
 
         # 平均有利子負債
-        df['平均有利子負債'] = df['FF_TOT_DEBT']
+#        df['平均有利子負債'] = df['FF_TOT_DEBT']
         
         # 時価総額
         df['時価総額'] = df['FF_MKT_VAL']
         
-        # 企業価値
-        df['企業価値'] = df['FF_ENTERPRISE_VAL']
+        # 企業価値（存在する場合のみ）
+        if 'FF_ENTERPRISE_VAL' in df.columns:
+            df['企業価値'] = df['FF_ENTERPRISE_VAL']
+        else:
+            logger.warning("FF_ENTERPRISE_VAL列が見つかりません")
         
     def _fill_debt_interest_quarterly(self, df: pd.DataFrame) -> pd.DataFrame:
-        """有利子負債利息の四半期換算(ffill処理)"""
+        """
+        有利子負債利息の四半期換算(ffill処理)
+        
+        Args:
+            df: 財務データのDataFrame
+            
+        Returns:
+            前方補完処理済みのDataFrame
+        """
         # グループ化して前方補完
         df['FF_INT_EXP_DEBT'] = (
             df.groupby('FSYM_ID')['FF_INT_EXP_DEBT']
