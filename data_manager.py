@@ -283,7 +283,7 @@ class FactSetDataManager:
     def _get_entity_data(self) -> pd.DataFrame:
         """FactSetProviderから企業データを取得する統合メソッド"""
         # FactSetProviderから企業識別子データを取得し、従来形式に変換
-        identity_records = self.financial_provider.get_identity_records()
+        identity_records = self.financial_provider.get_identity_records(primary_equity_only=True)
         
         # レコードをDataFrameに変換
         entity_data = []
@@ -292,10 +292,10 @@ class FactSetDataManager:
                 'FACTSET_ENTITY_ID': record.factset_entity_id,
                 'FSYM_ID': record.fsym_id,
                 'FF_CO_NAME': record.company_name,
-                'ISO_COUNTRY_FACT': record.country_code,
+                'ISO_COUNTRY_FACT': record.headquarters_country_code,
                 'PRIMARY_EQUITY_FLAG': 1 if record.is_primary_equity else 0,
                 'FREF_SECURITY_TYPE': getattr(record, 'security_type', None),
-                'ACTIVE_FLAG': 1 if record.is_active else 0
+                'ACTIVE_FLAG': 1 if record.active_flag else 0
             })
         
         return pd.DataFrame(entity_data)
@@ -303,7 +303,7 @@ class FactSetDataManager:
     def _get_financial_data(self) -> pd.DataFrame:
         """FactSetProviderから財務データを取得する統合メソッド"""
         # FactSetProviderから財務データを取得し、従来形式に変換
-        financial_records = self.financial_provider.get_financial_records()
+        financial_records = self.financial_provider.get_financial_records(primary_equity_only=True)
         
         # レコードをDataFrameに変換
         financial_data = []
@@ -326,19 +326,27 @@ class FactSetDataManager:
                 # 負債
                 'FF_DEBT_ST': record.ff_debt_st,
                 'FF_DEBT_LT': record.ff_debt_lt,
-                'FF_TOT_DEBT': record.ff_tot_debt,
+                #'FF_TOT_DEBT': record.ff_debt,
+                'FF_PAY_ACCT': record.ff_pay_acct,  # 買掛金
+                'FF_LIABS_CURR_MISC': record.ff_liabs_curr_misc,  # その他流動負債
                 # 株主資本
-                'FF_SH_EQ': record.ff_sh_eq,
-                # 税率
+                #'FF_SH_EQ': record.ff_sh_eq,
+                # 税務・利息項目
                 'FF_TAX_RATE': record.ff_tax_rate,
+                'FF_INC_TAX': record.ff_inc_tax,  # 法人税
+                'FF_EQ_AFF_INC': record.ff_eq_aff_inc,  # 持分法投資損益
+                'FF_INT_EXP_DEBT': record.ff_int_exp_debt,  # 有利子負債利息
+                # ROIC関連
+                'FF_ROIC': getattr(record, 'ff_roic', None),
+                'FF_EFF_INT_RATE': getattr(record, 'ff_eff_int_rate', None),
                 # キャッシュフロー
-                'FF_CF_OPER': record.ff_cf_oper,
-                'FF_CAPEX': record.ff_capex,
-                'FF_CF_INV': record.ff_cf_inv,
-                'FF_CF_FIN': record.ff_cf_fin,
+                #'FF_CF_OPER': record.ff_cf_oper,
+                #'FF_CAPEX': record.ff_capex,
+                #'FF_CF_INV': record.ff_cf_inv,
+                #'FF_CF_FIN': record.ff_cf_fin,
                 # 時価総額関連
                 'FF_MKT_VAL': record.ff_mkt_val,
-                'FF_ENTERPRISE_VAL': record.ff_enterprise_val
+                #'FF_ENTERPRISE_VAL': record.ff_enterprise_val
             })
         
         df = pd.DataFrame(financial_data)
@@ -349,20 +357,40 @@ class FactSetDataManager:
         # 必要な計算済み列を追加（従来のコードと互換性を保つため）
         self._add_calculated_financial_columns(df)
         
+        # 地域マッピング
+        currencies = df["CURRENCY"].unique()
+        region_df = self.geo_processor.get_region_mapping(currencies)
+        df = df.merge(region_df, on=["CURRENCY"], how="left")
+        
         return df
     
     def _add_calculated_financial_columns(self, df: pd.DataFrame) -> None:
-        """計算済み財務列を追加"""
-        # 営業利益（税引後）の計算
-        df['営業利益(税引後)'] = df['FF_OPER_INC'] * (1 - df['FF_TAX_RATE'].fillna(0.25))
-        
-        # 投下資本（運用ベース）の計算
-        df['投下資本(運用ベース)'] = (
-            df['FF_ASSETS'] - df['FF_ASSETS_CURR'] +
-            df['FF_ASSETS_CURR'].fillna(0) -
-            (df['FF_DEBT_ST'].fillna(0) + df['FF_DEBT_LT'].fillna(0) - df['FF_TOT_DEBT'].fillna(0))
+        """計算済み財務列を追加（元のコードと同じ計算ロジック）"""
+        # パーセント値を小数点形式に変換
+        if 'FF_ROIC' in df.columns:
+            df["FF_ROIC"] /= 100
+        df["FF_TAX_RATE"] /= 100
+        if 'FF_EFF_INT_RATE' in df.columns:
+            df["FF_EFF_INT_RATE"] /= 100
+
+        # 基本計算（元のコードと同じロジック）
+        df["固定資産合計"] = df["FF_ASSETS"] - df["FF_ASSETS_CURR"]
+        df["投下資本(運用ベース)"] = (
+            df["固定資産合計"] +
+            df["FF_ASSETS_CURR"] -
+            df["FF_PAY_ACCT"].fillna(0) -
+            df["FF_LIABS_CURR_MISC"].fillna(0)
         )
-        
+        df["営業利益(税引後)"] = (
+            df["FF_OPER_INC"] -
+            df["FF_INC_TAX"].fillna(0) +
+            df["FF_EQ_AFF_INC"].fillna(0)
+        )
+
+        # 有利子負債利息の四半期換算(ffill処理)
+        if 'FF_INT_EXP_DEBT' in df.columns:
+            df = self._fill_debt_interest_quarterly(df)
+
         # 平均有利子負債
         df['平均有利子負債'] = df['FF_TOT_DEBT']
         
@@ -371,5 +399,14 @@ class FactSetDataManager:
         
         # 企業価値
         df['企業価値'] = df['FF_ENTERPRISE_VAL']
+        
+    def _fill_debt_interest_quarterly(self, df: pd.DataFrame) -> pd.DataFrame:
+        """有利子負債利息の四半期換算(ffill処理)"""
+        # グループ化して前方補完
+        df['FF_INT_EXP_DEBT'] = (
+            df.groupby('FSYM_ID')['FF_INT_EXP_DEBT']
+            .ffill()
+        )
+        return df
 
 
