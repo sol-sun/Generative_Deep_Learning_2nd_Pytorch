@@ -179,7 +179,11 @@ from pydantic import (
 from gppm.utils.country_code_manager import (
     normalize_country_code, 
     get_country_name,
-    is_valid_country_code
+    is_valid_country_code,
+    get_country_manager,
+    Alpha2Code,
+    Alpha3Code,
+    CountryCodeInput
 )
 from gppm.utils.config_manager import get_logger
 
@@ -188,7 +192,8 @@ from gppm.utils.config_manager import get_logger
 # Type Definitions and Constants
 # ==================================================================================
 
-CountryCode = str  # ISO 3166-1 alpha-2 format (normalized)
+# 型エイリアス
+CountryCode = Alpha2Code  # ISO 3166-1 alpha-2 format (normalized)
 RateValue = float  # Percentage rate as decimal (0.0 to 1.0)
 
 # Default parameters for fallback scenarios
@@ -228,6 +233,9 @@ class CountryRiskParams(BaseModel):
     - total_cost_of_equity: 株主資本コスト（RF + MRP、ベータ=1前提）
     - after_tax_benefit: 税制による債務コスト軽減効果
     """
+    
+    # 国コード情報（警告メッセージ用、オプション）
+    country_code: Optional[Alpha2Code] = Field(default=None, description="国コード（警告メッセージ用）")
     
     model_config = ConfigDict(
         frozen=True,
@@ -293,19 +301,59 @@ class CountryRiskParams(BaseModel):
         
         - リスクフリーレートがマーケットリスクプレミアムより極端に高くないかチェック
         - 税率が経済合理性の範囲内かチェック
+        - 国コード情報がある場合は詳細な警告メッセージを出力
         """
-        # リスクフリーレートとマーケットリスクプレミアムの関係性チェック
-        if self.risk_free_rate > 0.20:  # 20%以上のリスクフリーレートは異常
+        # 国コード情報の取得
+        country_code: Optional[Alpha2Code] = self.country_code
+        if country_code:
+            country_manager = get_country_manager()
+            country_info = country_manager.get_country_info(country_code)
+            if country_info:
+                # 詳細な国情報を取得
+                country_name: str = country_info.name
+                region: Optional[str] = country_info.region
+                alpha3: str = country_info.alpha3
+                display_name = f"{country_name} ({country_code}/{alpha3}, {region or 'Unknown'})"
+            else:
+                # 国コードが無効な場合
+                display_name = f"無効な国コード ({country_code})"
+        else:
+            display_name = "未知の国"
+        
+        # リスクフリーレートの異常値チェック
+        if self.risk_free_rate > 0.20:  # 20%以上
             logger.warning(
-                f"リスクフリーレートが異常に高い値です: {self.risk_free_rate:.2%}。"
+                f"{display_name}: リスクフリーレートが異常に高い値です: {self.risk_free_rate:.2%}。"
                 "ハイパーインフレ国や極めて不安定な経済状況でない限り確認してください。"
             )
-        
-        # マーケットリスクプレミアムの妥当性チェック
-        if self.market_risk_premium < 0.01:  # 1%未満は異常に低い
+        elif self.risk_free_rate < 0.001:  # 0.1%未満
             logger.warning(
-                f"マーケットリスクプレミアムが異常に低い値です: {self.market_risk_premium:.2%}。"
+                f"{display_name}: リスクフリーレートが異常に低い値です: {self.risk_free_rate:.2%}。"
+                "データの正確性を確認してください。"
+            )
+        
+        # マーケットリスクプレミアムの異常値チェック
+        if self.market_risk_premium < 0.01:  # 1%未満
+            logger.warning(
+                f"{display_name}: マーケットリスクプレミアムが異常に低い値です: {self.market_risk_premium:.2%}。"
                 "一般的には3-8%の範囲が標準的です。"
+            )
+        elif self.market_risk_premium > 0.20:  # 20%以上
+            logger.warning(
+                f"{display_name}: マーケットリスクプレミアムが異常に高い値です: {self.market_risk_premium:.2%}。"
+                "新興国や極めて不安定な市場でない限り確認してください。"
+            )
+        
+        # 税率の異常値チェック
+        if self.country_tax_rate > 0.60:  # 60%以上
+            logger.warning(
+                f"{display_name}: 法人税率が異常に高い値です: {self.country_tax_rate:.2%}。"
+                "データの正確性を確認してください。"
+            )
+        elif self.country_tax_rate < 0.05:  # 5%未満
+            logger.warning(
+                f"{display_name}: 法人税率が異常に低い値です: {self.country_tax_rate:.2%}。"
+                "データの正確性を確認してください。"
             )
         
         return self
@@ -389,11 +437,9 @@ class CountryRiskData(BaseModel):
         extra="forbid"
     )
     
-    iso_code: CountryCode = Field(
+    iso_code: CountryCodeInput = Field(
         description="ISO 3166-1国コード（alpha-2またはalpha-3、自動正規化）",
-        examples=["US", "JP", "USA", "JPN"],
-        min_length=2,
-        max_length=3
+        examples=["US", "JP", "USA", "JPN"]
     )
     
     tax_rate: Optional[RateValue] = Field(
@@ -422,7 +468,7 @@ class CountryRiskData(BaseModel):
     
     @field_validator("iso_code", mode="before")
     @classmethod
-    def validate_and_normalize_country_code(cls, v: Union[str, None]) -> str:
+    def validate_and_normalize_country_code(cls, v: Union[str, None]) -> Alpha2Code:
         """
         国コードの検証と正規化。
         
@@ -438,9 +484,15 @@ class CountryRiskData(BaseModel):
             raise ValueError("ISO国コードは空白であってはいけません")
             
         # 国コード正規化と存在確認
-        normalized_code = normalize_country_code(code)
+        country_manager = get_country_manager()
+        if not country_manager.is_valid_country_code(code):
+            # より詳細なエラーメッセージを提供
+            raise ValueError(f"無効な国コード: {code} (ISO 3166-1準拠の有効な国コードを入力してください)")
+            
+        # alpha-2形式に正規化
+        normalized_code = country_manager.convert_to_alpha2(code)
         if normalized_code is None:
-            raise ValueError(f"無効な国コード: {code}")
+            raise ValueError(f"国コードの正規化に失敗: {code}")
             
         return normalized_code
     
@@ -484,12 +536,13 @@ class CountryRiskData(BaseModel):
         except (ValueError, TypeError, InvalidOperation):
             raise ValueError(f"無効なレート値: {v}")
     
-    def to_risk_params(self, default_params: CountryRiskParams) -> CountryRiskParams:
+    def to_risk_params(self, default_params: CountryRiskParams, country_code: Optional[Alpha2Code] = None) -> CountryRiskParams:
         """
         デフォルト値を使用してCountryRiskParamsに変換。
         
         Args:
             default_params: 欠損値の補完に使用するデフォルトパラメータ
+            country_code: 国コード（警告メッセージ用）
             
         Returns:
             完全なCountryRiskParamsインスタンス
@@ -497,7 +550,8 @@ class CountryRiskData(BaseModel):
         return CountryRiskParams(
             risk_free_rate=self.risk_free_rate or default_params.risk_free_rate,
             market_risk_premium=self.market_risk_premium or default_params.market_risk_premium,
-            country_tax_rate=self.tax_rate or default_params.country_tax_rate
+            country_tax_rate=self.tax_rate or default_params.country_tax_rate,
+            country_code=country_code
         )
 
 
@@ -542,7 +596,7 @@ class CountryRiskLoadResult(BaseModel):
         ge=0.0
     )
     
-    loaded_countries: Set[CountryCode] = Field(
+    loaded_countries: Set[Alpha2Code] = Field(
         default_factory=set,
         description="正常に読み込まれた国コードのセット"
     )
@@ -720,12 +774,18 @@ class CountryRiskParametersManager:
                         market_risk_premium=row['MRP'] if pd.notna(row['MRP']) else None
                     )
                     
-                    # デフォルト値で欠損値を補完
-                    risk_params = risk_data.to_risk_params(self._default_params)
+                    # 国コード情報を取得
+                    country_code: Alpha2Code = risk_data.iso_code
+                    
+                    # デフォルト値で欠損値を補完（国コード情報付きでバリデーション実行）
+                    risk_params_with_country = risk_data.to_risk_params(self._default_params, country_code)
                     
                     # 正規化済み国コードで保存
-                    country_code = risk_data.iso_code
-                    self._params[country_code] = risk_params
+                    self._params[country_code] = CountryRiskParams(
+                        risk_free_rate=risk_params_with_country.risk_free_rate,
+                        market_risk_premium=risk_params_with_country.market_risk_premium,
+                        country_tax_rate=risk_params_with_country.country_tax_rate
+                    )
                     
                     successful_records += 1
                     loaded_countries.add(country_code)
@@ -741,9 +801,16 @@ class CountryRiskParametersManager:
                     
                     if missing_fields:
                         warning_records += 1
-                        country_name = get_country_name(country_code) or country_code
+                        # 詳細な国情報を取得
+                        country_manager = get_country_manager()
+                        country_info = country_manager.get_country_info(country_code)
+                        if country_info:
+                            display_name = f"{country_info.name} ({country_code}/{country_info.alpha3}, {country_info.region or 'Unknown'})"
+                        else:
+                            display_name = f"無効な国コード ({country_code})"
+                        
                         logger.warning(
-                            f"{country_name} ({country_code}): "
+                            f"{display_name}: "
                             f"欠損フィールド {missing_fields} をデフォルト値で補完"
                         )
                     
@@ -790,7 +857,7 @@ class CountryRiskParametersManager:
             logger.error(f"CSVファイルの読み込みに失敗: {e}")
             raise ValueError(f"CSVファイルの読み込みエラー: {self._csv_path} - {e}")
     
-    def get_country_params(self, country_code: str) -> CountryRiskParams:
+    def get_country_params(self, country_code: Union[Alpha2Code, Alpha3Code, str]) -> CountryRiskParams:
         """
         指定された国のリスクパラメータを取得。
         
@@ -812,14 +879,23 @@ class CountryRiskParametersManager:
         if normalized_code and normalized_code in self._params:
             return self._params[normalized_code]
         else:
-            country_name = get_country_name(normalized_code) if normalized_code else "未知"
-            logger.debug(
-                f"国コード {country_code} ({country_name}) のパラメータが見つかりません。"
-                "デフォルト値を使用します。"
-            )
+            # 詳細な国情報取得
+            country_manager = get_country_manager()
+            country_info = country_manager.get_country_info(normalized_code) if normalized_code else None
+            
+            if country_info:
+                logger.debug(
+                    f"国コード {country_code} ({country_info.name}/{country_info.alpha3}, {country_info.region}) "
+                    f"のパラメータが見つかりません。デフォルト値を使用します。"
+                )
+            else:
+                logger.debug(
+                    f"国コード {country_code} (無効な国コード) のパラメータが見つかりません。"
+                    "デフォルト値を使用します。"
+                )
             return self._default_params
     
-    def get_all_country_params(self) -> Dict[CountryCode, CountryRiskParams]:
+    def get_all_country_params(self) -> Dict[Alpha2Code, CountryRiskParams]:
         """
         全ての国のリスクパラメータを取得。
         
@@ -831,6 +907,8 @@ class CountryRiskParametersManager:
         """
         return self._params.copy()
     
+
+    
     def get_default_params(self) -> CountryRiskParams:
         """
         デフォルトパラメータを取得。
@@ -840,7 +918,7 @@ class CountryRiskParametersManager:
         """
         return self._default_params
     
-    def is_available(self, country_code: str) -> bool:
+    def is_available(self, country_code: Union[Alpha2Code, Alpha3Code, str]) -> bool:
         """
         指定された国のパラメータが利用可能かどうかを判定。
         
@@ -858,7 +936,7 @@ class CountryRiskParametersManager:
         normalized_code = normalize_country_code(country_code)
         return normalized_code is not None and normalized_code in self._params
     
-    def get_available_countries(self) -> Set[CountryCode]:
+    def get_available_countries(self) -> Set[Alpha2Code]:
         """
         データが利用可能な国コードのセットを取得。
         
@@ -876,7 +954,7 @@ class CountryRiskParametersManager:
         """
         return self._load_result
     
-    def get_countries_by_region(self, region: str) -> Dict[CountryCode, CountryRiskParams]:
+    def get_countries_by_region(self, region: str) -> Dict[Alpha2Code, CountryRiskParams]:
         """
         指定地域の国のパラメータを取得。
         
@@ -1071,7 +1149,7 @@ def reset_country_risk_manager() -> None:
 # Convenience Functions
 # ==================================================================================
 
-def get_country_risk_params(country_code: str) -> CountryRiskParams:
+def get_country_risk_params(country_code: Union[Alpha2Code, Alpha3Code, str]) -> CountryRiskParams:
     """
     指定国のリスクパラメータを取得（便利関数）。
     
@@ -1090,7 +1168,7 @@ def get_country_risk_params(country_code: str) -> CountryRiskParams:
     return manager.get_country_params(country_code)
 
 
-def is_country_risk_available(country_code: str) -> bool:
+def is_country_risk_available(country_code: Union[Alpha2Code, Alpha3Code, str]) -> bool:
     """
     指定国のリスクパラメータが利用可能かを判定（便利関数）。
     
@@ -1108,7 +1186,7 @@ def is_country_risk_available(country_code: str) -> bool:
     return manager.is_available(country_code)
 
 
-def get_all_available_country_codes() -> Set[CountryCode]:
+def get_all_available_country_codes() -> Set[Alpha2Code]:
     """
     データが利用可能な全国コードを取得（便利関数）。
     
