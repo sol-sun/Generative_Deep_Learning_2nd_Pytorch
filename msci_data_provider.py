@@ -26,22 +26,24 @@ MSCIデータプロバイダー
     constituents = provider.get_index_constituents(
         index_name='WORLD',
         dividend_flag=False,
-        period=WolfPeriod.from_month(2023, 12)
+        period=WolfPeriod.from_month(2023, 12, freq=Frequency.M)
     )
 
     # インデックス値の取得（期間範囲）
+    start_period = WolfPeriod.from_month(2023, 1, freq=Frequency.M)
+    end_period = WolfPeriod.from_month(2023, 12, freq=Frequency.M)
     index_values = provider.get_index_values(
         index_name='WORLD',
         dividend_flag=False,
-        period=WolfPeriodRange.from_string('2023M1:2023M12')
+        period=WolfPeriodRange(start_period, end_period)
     )
 
     # ベータ計算（複数期間）
     beta_results = provider.get_beta(
         security_ids=['US0378331005', 'US0231351067'],
         period=[
-            WolfPeriod.from_month(2023, 12),
-            WolfPeriod.from_month(2023, 11)
+            WolfPeriod.from_month(2023, 12, freq=Frequency.M),
+            WolfPeriod.from_month(2023, 11, freq=Frequency.M)
         ],
         lookback_periods=60,
         index_name='WORLD',
@@ -625,9 +627,9 @@ class MSCIQueryParams(BaseModel):
             "- List[WolfPeriod]: 複数期間（ベータ計算等）"
         ),
         examples=[
-            "WolfPeriod.from_month(2023, 12)",
-            "WolfPeriodRange('2020M1:2023M12')",
-            "[WolfPeriod.from_month(2023, 12), WolfPeriod.from_month(2023, 11)]"
+            "WolfPeriod.from_month(2023, 12, freq=Frequency.M)",
+            "WolfPeriodRange(start_period, end_period)",
+            "[WolfPeriod.from_month(2023, 12, freq=Frequency.M), WolfPeriod.from_month(2023, 11, freq=Frequency.M)]"
         ]
     )
     
@@ -856,13 +858,14 @@ class MSCIProvider(DataProcessor):
             elif "as_of_dates" in uf:
                 dates_list = uf.pop("as_of_dates")
                 if isinstance(dates_list, list):
-                    uf["period"] = [WolfPeriod.from_day(d, freq=Frequency.M) for d in dates_list]
+                    uf["period"] = [WolfPeriod.from_month(d.year, d.month, freq=Frequency.M) for d in dates_list]
                 else:
-                    uf["period"] = [WolfPeriod.from_day(dates_list, freq=Frequency.M)]
+                    uf["period"] = [WolfPeriod.from_month(dates_list.year, dates_list.month, freq=Frequency.M)]
             
             # as_of_date (単数形) を period に変換
             elif "as_of_date" in uf and isinstance(uf["as_of_date"], date):
-                uf["period"] = WolfPeriod.from_day(uf["as_of_date"], freq=Frequency.M)
+                d = uf["as_of_date"]
+                uf["period"] = WolfPeriod.from_month(d.year, d.month, freq=Frequency.M)
 
         return MSCIQueryParams.model_validate(uf)
 
@@ -877,7 +880,7 @@ class MSCIProvider(DataProcessor):
         if period is None:
             # 後方互換性: as_of_dateから変換
             if params.as_of_date:
-                single_period = WolfPeriod.from_day(params.as_of_date, freq=Frequency.M)
+                single_period = WolfPeriod.from_month(params.as_of_date.year, params.as_of_date.month, freq=Frequency.M)
                 return single_period, None, None
             return None, None, None
         
@@ -962,9 +965,9 @@ class MSCIProvider(DataProcessor):
         params = self._normalize_query_params(params, kwargs)
         
         logger.info(
-            "MSCIインデックス値データ取得開始: index_name=%s period_range=%s batch_size=%d",
+            "MSCIインデックス値データ取得開始: index_name=%s period=%s batch_size=%d",
             params.index_name,
-            params.period_range,
+            params.period,
             params.batch_size
         )
         
@@ -1264,17 +1267,17 @@ class MSCIProvider(DataProcessor):
         if period_range:
             start_period = period_range.start
             end_period = period_range.stop if period_range.stop else period_range.start
-            start_ym = start_period.to_yyyymm()
-            end_ym = end_period.to_yyyymm()
+            start_ym = start_period.y * 100 + (start_period.m or 1)
+            end_ym = end_period.y * 100 + (end_period.m or 1)
             date_conditions.append(f"HISTORICAL_MONTH >= {start_ym}")
             date_conditions.append(f"HISTORICAL_MONTH <= {end_ym}")
         elif single_period:
-            ym = single_period.to_yyyymm()
+            ym = single_period.y * 100 + (single_period.m or 1)
             date_conditions.append(f"HISTORICAL_MONTH = {ym}")
         elif period_list:
             # 複数期間の場合は範囲として扱う
-            start_ym = min(p.to_yyyymm() for p in period_list)
-            end_ym = max(p.to_yyyymm() for p in period_list)
+            start_ym = min(p.y * 100 + (p.m or 1) for p in period_list)
+            end_ym = max(p.y * 100 + (p.m or 1) for p in period_list)
             date_conditions.append(f"HISTORICAL_MONTH >= {start_ym}")
             date_conditions.append(f"HISTORICAL_MONTH <= {end_ym}")
         
@@ -1523,9 +1526,10 @@ class MSCIProvider(DataProcessor):
         
         # 最も新しい基準期間から全体期間を計算
         max_as_of_period = max(as_of_periods)
-        start_period = max_as_of_period.shift(-lookback_periods)
+        start_period = max_as_of_period + (-lookback_periods)
         period_range = WolfPeriodRange(start_period, max_as_of_period)
-        min_start_date, period_end_date = period_range.to_date_range()
+        min_start_date = period_range.start.start_date
+        period_end_date = period_range.stop.end_date if period_range.stop else period_range.start.end_date
 
         # 3. データの一括取得
         unique_securities = list(dict.fromkeys(securities))
@@ -1539,7 +1543,7 @@ class MSCIProvider(DataProcessor):
             MSCIQueryParams(
                 security_ids=unique_securities,
                 identifier_type=identifier_type,
-                period_range=period_range,
+                period=period_range,
                 batch_size=batch_size
             )
         )
@@ -1553,7 +1557,7 @@ class MSCIProvider(DataProcessor):
                 index_name=index_name,
                 country_code=country_code,
                 dividend_flag=dividend_flag,
-                period_range=period_range,
+                period=period_range,
                 batch_size=batch_size
             )
         )
@@ -1604,9 +1608,10 @@ class MSCIProvider(DataProcessor):
 
         for as_of_period in sorted(as_of_periods, reverse=True):
             # 計算期間を取得
-            start_period = as_of_period.shift(-lookback_periods)
+            start_period = as_of_period + (-lookback_periods)
             period_range = WolfPeriodRange(start_period, as_of_period)
-            calc_start_date, calc_end_date = period_range.to_date_range()
+            calc_start_date = period_range.start.start_date
+            calc_end_date = period_range.stop.end_date if period_range.stop else period_range.start.end_date
             period_index_returns = index_returns.loc[calc_start_date:calc_end_date]
 
             for security in unique_securities:
@@ -1634,7 +1639,7 @@ class MSCIProvider(DataProcessor):
 
                 if result:
                     res_dict = result.to_dict()
-                    res_dict['as_of_date'] = as_of_period.start_date
+                    res_dict['as_of_date'] = as_of_period.end_date
                     all_results.append(res_dict)
         
         logger.info(f"ベータ計算完了: {len(all_results)}件の結果を生成しました。")
