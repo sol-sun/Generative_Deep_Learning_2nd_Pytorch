@@ -72,33 +72,33 @@ class RBICSStructureRecord(BaseModel):
     )
     
     # RBICS階層コード（L1～L6）
-    l1_id: Optional[constr(min_length=1, max_length=10)] = Field(
+    l1_id: Optional[constr(min_length=2, max_length=2)] = Field(
         default=None,
-        description="L1コード（セクター）",
+        description="L1コード（セクター、2桁）",
         examples=["10", "15", "20"]
     )
-    l2_id: Optional[constr(min_length=1, max_length=10)] = Field(
+    l2_id: Optional[constr(min_length=4, max_length=4)] = Field(
         default=None,
-        description="L2コード（業界グループ）",
+        description="L2コード（業界グループ、4桁）",
         examples=["1010", "1510", "2010"]
     )
-    l3_id: Optional[constr(min_length=1, max_length=10)] = Field(
+    l3_id: Optional[constr(min_length=6, max_length=6)] = Field(
         default=None,
-        description="L3コード（業界）",
+        description="L3コード（業界、6桁）",
         examples=["101010", "151010", "201010"]
     )
-    l4_id: Optional[constr(min_length=1, max_length=10)] = Field(
+    l4_id: Optional[constr(min_length=8, max_length=8)] = Field(
         default=None,
-        description="L4コード（サブ業界）",
+        description="L4コード（サブ業界、8桁）",
         examples=["10101010", "15101010", "20101010"]
     )
-    l5_id: Optional[constr(min_length=1, max_length=10)] = Field(
+    l5_id: Optional[constr(min_length=10, max_length=10)] = Field(
         default=None,
-        description="L5コード（詳細サブ業界）",
+        description="L5コード（詳細サブ業界、10桁）",
         examples=["1010101010", "1510101010", "2010101010"]
     )
-    l6_id: constr(min_length=1, max_length=10) = Field(
-        description="L6コード（最詳細分類）",
+    l6_id: constr(min_length=12, max_length=12) = Field(
+        description="L6コード（最詳細分類、12桁）",
         examples=["101010101010", "151010101010", "201010101010"]
     )
     
@@ -134,7 +134,7 @@ class RBICSStructureRecord(BaseModel):
     )
     
     # 説明・詳細情報
-    sector_description: Optional[constr(min_length=1, max_length=1000)] = Field(
+    sector_description: Optional[constr(min_length=1, max_length=5000)] = Field(
         default=None,
         description="セクター説明",
         examples=["Energy sector includes companies involved in exploration and production of oil and gas"]
@@ -302,8 +302,16 @@ class RBICSCompanyRecord(BaseModel):
         description="セグメントタイプ",
         examples=[SegmentType.REVENUE, SegmentType.FOCUS]
     )
-    rbics_l6_id: constr(min_length=1, max_length=10) = Field(
-        description="RBICS L6分類コード",
+    
+    # RBICS ID（セグメントタイプに応じて使い分け）
+    focus_l6_id: Optional[constr(min_length=12, max_length=12)] = Field(
+        default=None,
+        description="会社単体に与えられるRBICS L6分類コード（12桁）",
+        examples=["101010101010"]
+    )
+    revenue_l6_id: Optional[constr(min_length=12, max_length=12)] = Field(
+        default=None,
+        description="会社のセグメントに与えられるRBICS L6分類コード（12桁）",
         examples=["101010101010"]
     )
     
@@ -373,10 +381,23 @@ class RBICSCompanyRecord(BaseModel):
     @model_validator(mode="after")
     def _validate_segment_consistency(self) -> "RBICSCompanyRecord":
         """セグメント情報の整合性を検証。"""
-        # 売上セグメントの場合はセグメント詳細情報が必要
+        # 売上セグメントの場合はセグメント詳細情報とREVENUE_L6_IDが必要
         if self.segment_type == SegmentType.REVENUE:
             if not self.segment_id or not self.segment_name:
                 raise ValueError("売上セグメントにはセグメントIDと名称が必要です")
+            if not self.revenue_l6_id:
+                raise ValueError("売上セグメントにはREVENUE_L6_IDが必要です")
+            if self.focus_l6_id:
+                raise ValueError("売上セグメントではFOCUS_L6_IDは使用されません")
+        
+        # フォーカスセグメントの場合はFOCUS_L6_IDが必要
+        elif self.segment_type == SegmentType.FOCUS:
+            if not self.focus_l6_id:
+                raise ValueError("フォーカスセグメントにはFOCUS_L6_IDが必要です")
+            if self.revenue_l6_id:
+                raise ValueError("フォーカスセグメントではREVENUE_L6_IDは使用されません")
+            if self.segment_id or self.segment_name or self.revenue_share:
+                raise ValueError("フォーカスセグメントではセグメント詳細情報は使用されません")
         
         # 少なくとも1つの識別子が必要
         identifiers = [self.factset_entity_id, self.cusip, self.isin, self.sedol, self.ticker]
@@ -402,6 +423,16 @@ class RBICSCompanyRecord(BaseModel):
     def is_revenue_segment(self) -> bool:
         """売上セグメントかどうか（遅延評価）。"""
         return self.segment_type == SegmentType.REVENUE
+    
+    @computed_field
+    @property
+    def rbics_l6_id(self) -> Optional[str]:
+        """適用可能なRBICS L6 ID（セグメントタイプに応じて自動選択）。"""
+        if self.segment_type == SegmentType.REVENUE:
+            return self.revenue_l6_id
+        elif self.segment_type == SegmentType.FOCUS:
+            return self.focus_l6_id
+        return None
     
     @computed_field
     @property
@@ -433,11 +464,6 @@ class RBICSQueryParams(BaseModel):
     )
     
     # 企業フィルタ
-    company_ids: Optional[List[constr(min_length=1, max_length=20)]] = Field(
-        default=None,
-        description="REVERE Company IDリスト",
-        examples=[["123456789", "987654321"]]
-    )
     factset_entity_ids: Optional[List[constr(min_length=1, max_length=20)]] = Field(
         default=None,
         description="FactSet Entity IDリスト",
@@ -477,9 +503,9 @@ class RBICSQueryParams(BaseModel):
         description="取得するRBICS階層レベル",
         examples=[[RBICSLevel.L1, RBICSLevel.L6]]
     )
-    rbics_l6_ids: Optional[List[constr(min_length=1, max_length=10)]] = Field(
+    rbics_l6_ids: Optional[List[constr(min_length=12, max_length=12)]] = Field(
         default=None,
-        description="RBICS L6分類コードリスト",
+        description="RBICS L6分類コードリスト（12桁）",
         examples=[["101010101010", "151010101010"]]
     )
     

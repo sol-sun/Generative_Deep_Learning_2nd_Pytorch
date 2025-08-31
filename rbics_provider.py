@@ -112,10 +112,10 @@ class RBICSProvider(DataProcessor):
         uf: Dict[str, Any] = dict(kwargs) if kwargs else {}
         
         # エイリアス処理とリスト昇格
-        if "company_ids" not in uf and "company_id" in uf:
-            uf["company_ids"] = uf.pop("company_id")
-        if "company_ids" in uf and isinstance(uf["company_ids"], str):
-            uf["company_ids"] = [uf["company_ids"]]
+        if "factset_entity_ids" not in uf and "factset_entity_id" in uf:
+            uf["factset_entity_ids"] = uf.pop("factset_entity_id")
+        if "factset_entity_ids" in uf and isinstance(uf["factset_entity_ids"], str):
+            uf["factset_entity_ids"] = [uf["factset_entity_ids"]]
         
         if "region_codes" not in uf:
             if "region_code" in uf:
@@ -171,9 +171,9 @@ class RBICSProvider(DataProcessor):
         params = self._normalize_query_params(params, kwargs)
         
         logger.info(
-            "RBICS企業データ取得開始: segment_types=%s company_ids=%s batch_size=%d",
+            "RBICS企業データ取得開始: segment_types=%s factset_entity_ids=%s batch_size=%d",
             params.segment_types,
-            len(params.company_ids) if params.company_ids else 0,
+            len(params.factset_entity_ids) if params.factset_entity_ids else 0,
             params.batch_size
         )
         
@@ -284,10 +284,10 @@ class RBICSProvider(DataProcessor):
         where_conditions = []
         sql_params = []
         
-        if params.company_ids:
-            placeholders = ",".join(["%s"] * len(params.company_ids))
-            where_conditions.append(f"A.COMPANY_ID IN ({placeholders})")
-            sql_params.extend(params.company_ids)
+        if params.factset_entity_ids:
+            placeholders = ",".join(["%s"] * len(params.factset_entity_ids))
+            where_conditions.append(f"G.FS_ENTITY_ID IN ({placeholders})")
+            sql_params.extend(params.factset_entity_ids)
         
         if params.min_revenue_share is not None:
             where_conditions.append("B.REVENUE_PERCENT >= %s")
@@ -377,10 +377,10 @@ class RBICSProvider(DataProcessor):
         where_conditions = []
         sql_params = []
         
-        if params.company_ids:
-            placeholders = ",".join(["%s"] * len(params.company_ids))
-            where_conditions.append(f"A.COMPANY_ID IN ({placeholders})")
-            sql_params.extend(params.company_ids)
+        if params.factset_entity_ids:
+            placeholders = ",".join(["%s"] * len(params.factset_entity_ids))
+            where_conditions.append(f"D.FS_ENTITY_ID IN ({placeholders})")
+            sql_params.extend(params.factset_entity_ids)
         
         where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
         
@@ -390,9 +390,10 @@ class RBICSProvider(DataProcessor):
                 A.COMPANY_ID,
                 B.NAME AS COMPANY_NAME,
                 B.HOME_REGION AS REGION_CODE,
-                A.RBICS2_L6_ID AS RBICS_L6_ID,
+                A.RBICS2_L6_ID AS FOCUS_L6_ID,
                 C.COUNTRY AS HQ_REGION_CODE,
                 D.FS_ENTITY_ID AS FACTSET_ENTITY_ID,
+                E.NAME AS REGION_NAME,
                 B.SEDOL, B.TICKER, B.ISIN, B.CUSIP
             FROM {FactSetRevereTable.FOCUS_L6} AS A
             LEFT OUTER JOIN {FactSetRevereTable.COMPANY} AS B 
@@ -408,6 +409,10 @@ class RBICSProvider(DataProcessor):
                 ON A.COMPANY_ID = D.COMPANY_ID
                 AND D.START$ < CONVERT(DATETIME, '{end_condition}')
                 AND D.END$ > CONVERT(DATETIME, '{start_condition}')
+            LEFT OUTER JOIN {FactSetRevereTable.REGION} AS E
+                ON B.HOME_REGION = E.ID
+                AND E.START$ < CONVERT(DATETIME, '{end_condition}')
+                AND E.END$ > CONVERT(DATETIME, '{start_condition}')
             WHERE 
                 A.START$ < CONVERT(DATETIME, '{end_condition}')
                 AND A.END$ > CONVERT(DATETIME, '{start_condition}')
@@ -507,12 +512,13 @@ class RBICSProvider(DataProcessor):
                         if pd.notna(revenue_share):
                             revenue_share = float(revenue_share)
                     
-                    # RBICSのL6 IDを適切に取得
-                    rbics_l6_id = None
+                    # RBICS IDを適切に設定
+                    focus_l6_id = None
+                    revenue_l6_id = None
                     if segment_type == SegmentType.REVENUE:
-                        rbics_l6_id = row.get("REVENUE_L6_ID")
-                    else:
-                        rbics_l6_id = row.get("RBICS_L6_ID")
+                        revenue_l6_id = row.get("REVENUE_L6_ID")
+                    elif segment_type == SegmentType.FOCUS:
+                        focus_l6_id = row.get("FOCUS_L6_ID")
                     
                     record = RBICSCompanyRecord(
                         company_id=row.get("COMPANY_ID"),
@@ -526,7 +532,8 @@ class RBICSProvider(DataProcessor):
                         region_code=row.get("REGION_CODE"),
                         hq_region_code=row.get("HQ_REGION_CODE"),
                         segment_type=segment_type,
-                        rbics_l6_id=rbics_l6_id,
+                        focus_l6_id=focus_l6_id,
+                        revenue_l6_id=revenue_l6_id,
                         segment_id=row.get("SEGMENT_ID") if segment_type == SegmentType.REVENUE else None,
                         segment_name=row.get("SEGMENT_NAME") if segment_type == SegmentType.REVENUE else None,
                         revenue_share=revenue_share,
