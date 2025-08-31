@@ -66,6 +66,7 @@ class FactSetRevereTable:
     BUS_SEG_REPORT = 'FACTSET_REVERE..COMPANY_RBICS2_BUS_SEG_REPORT'
     BUS_SEG_ITEM = 'FACTSET_REVERE..COMPANY_RBICS2_BUS_SEG_ITEM'
     FOCUS_L6 = 'FACTSET_REVERE..COMPANY_RBICS2_FOCUS_L6'
+    REGION = 'FACTSET_REVERE..REGION'
 
 
 class RBICSProvider(DataProcessor):
@@ -247,7 +248,7 @@ class RBICSProvider(DataProcessor):
             SELECT
                 L1_ID, L2_ID, L3_ID, L4_ID, L5_ID, L6_ID,
                 L1_NAME, L2_NAME, L3_NAME, L4_NAME, L5_NAME, L6_NAME,
-                L6_DESC AS SECTOR_DESC,
+                L6_DESCR AS SECTOR_DESC,
                 START$ AS EFFECTIVE_START,
                 END$ AS EFFECTIVE_END
             FROM {FactSetRevereTable.RBICS_STRUCTURE}
@@ -300,18 +301,18 @@ class RBICSProvider(DataProcessor):
         try:
             sql = f"""
             SELECT DISTINCT
-                D.ID AS COMPANY_ID,
-                G.FS_ENTITY_ID AS FACTSET_ENTITY_ID,                
-                D.NAME AS COMPANY_NAME,
-                D.SEDOL, D.TICKER, D.ISIN, D.CUSIP,
-                H.NAME AS REGION_NAME,
-                H.HOME_REGION AS REGION_CODE,
-                C.COUNTRY AS HQ_REGION_CODE,
-                A.PERIOD_END_DATE,
-                B.ID AS SEGMENT_ID,
-                B.NAME AS SEGMENT_NAME,
-                B.REVENUE_PERCENT AS REVENUE_SHARE,
-                B.RBICS2_L6_ID AS RBICS_L6_ID
+                D.ID AS COMPANY_ID,               -- FactSet定義の企業ID
+                G.FS_ENTITY_ID AS FACTSET_ENTITY_ID, -- 企業名 (en)
+                D.NAME AS COMPANY_NAME,           -- その他ID
+                D.SEDOL, D.TICKER, D.ISIN, D.CUSIP,  -- 会社の法的所在地
+                E.NAME AS REGION_NAME,            -- HQまたは法的所在地名
+                D.HOME_REGION AS REGION_CODE,     -- HQ所在地コード
+                C.COUNTRY AS HQ_REGION_CODE,      -- HQ所在地コード
+                A.PERIOD_END_DATE,                -- レポートの会計終了日付
+                B.ID AS SEGMENT_ID,               -- 開示文書由来のFactSet定義のセグメントID
+                B.NAME AS SEGMENT_NAME,           -- 開示文書由来のFactSet定義のセグメント名
+                B.REVENUE_PERCENT AS SEG_SHARE,   -- セグメントごとのセールスシェア
+                B.RBICS2_L6_ID AS REVENUE_L6_ID   -- RBICS(ID) 第6レベルのセクター
             FROM {FactSetRevereTable.BUS_SEG_REPORT} A
             INNER JOIN (
                 SELECT
@@ -321,7 +322,7 @@ class RBICSProvider(DataProcessor):
                 FROM {FactSetRevereTable.BUS_SEG_REPORT}
                 WHERE START$ < CONVERT(DATETIME, '{end_condition}')
                   AND END$ > CONVERT(DATETIME, '{start_condition}')
-                  AND PERIOD_END_DATE >= CONVERT(DATETIME, '{start_condition}') - 550
+                  AND START$ < CONVERT(DATETIME, '{start_condition}') - 550
                 GROUP BY COMPANY_ID
             ) F ON A.COMPANY_ID = F.COMPANY_ID
                AND A.PERIOD_END_DATE = F.PERIOD_END_DATE
@@ -334,19 +335,20 @@ class RBICSProvider(DataProcessor):
                 ON A.COMPANY_ID = D.ID
                AND D.START$ < CONVERT(DATETIME, '{end_condition}')
                AND D.END$ > CONVERT(DATETIME, '{start_condition}')
+               AND D.COVERED = 'Y'
             LEFT OUTER JOIN {FactSetRevereTable.COMPANY_ADDRESS} C
                 ON D.ID = C.COMPANY_ID
-               AND C.COVERED = 'Y'
+               AND C.HQ = 'Y'
                AND C.START$ < CONVERT(DATETIME, '{end_condition}')
                AND C.END$ > CONVERT(DATETIME, '{start_condition}')
-            LEFT OUTER JOIN {FactSetRevereTable.COMPANY_FACTSET} G
-                ON A.COMPANY_ID = G.COMPANY_ID
+            INNER JOIN {FactSetRevereTable.REGION} E -- #TODO: COUNTRYとの違いを調べておく
+                ON D.HOME_REGION = E.ID
+               AND E.START$ < CONVERT(DATETIME, '{end_condition}')
+               AND E.END$ > CONVERT(DATETIME, '{start_condition}')
+            INNER JOIN {FactSetRevereTable.COMPANY_FACTSET} G
+                ON D.ID = G.COMPANY_ID
                AND G.START$ < CONVERT(DATETIME, '{end_condition}')
                AND G.END$ > CONVERT(DATETIME, '{start_condition}')
-            LEFT OUTER JOIN {FactSetRevereTable.COMPANY_HQ} H
-                ON D.ID = H.COMPANY_ID
-               AND H.START$ < CONVERT(DATETIME, '{end_condition}')
-               AND H.END$ > CONVERT(DATETIME, '{start_condition}')
             WHERE 1=1{additional_where}
             ORDER BY D.ID, B.REVENUE_PERCENT DESC
             """
@@ -355,8 +357,8 @@ class RBICSProvider(DataProcessor):
             df = self.db.execute_query(sql, params=sql_params)
             
             if not df.empty:
-                if 'REVENUE_SHARE' in df.columns:
-                    df['REVENUE_SHARE'] = pd.to_numeric(df['REVENUE_SHARE'], errors='coerce') / 100
+                if 'SEG_SHARE' in df.columns:
+                    df['SEG_SHARE'] = pd.to_numeric(df['SEG_SHARE'], errors='coerce') / 100
                 
                 logger.info(f"RBICS売上セグメント取得: {len(df)}件")
             else:
@@ -458,8 +460,8 @@ class RBICSProvider(DataProcessor):
                         l5_name=row.get("L5_NAME"),
                         l6_name=row.get("L6_NAME"),
                         sector_description=row.get("SECTOR_DESC"),
-                        effective_start=pd.to_datetime(row.get("EFFECTIVE_START")).date() if pd.notna(row.get("EFFECTIVE_START")) else None,
-                        effective_end=pd.to_datetime(row.get("EFFECTIVE_END")).date() if pd.notna(row.get("EFFECTIVE_END")) else None,
+                        effective_start=row.get("EFFECTIVE_START").date() if row.get("EFFECTIVE_START") is not None else None,
+                        effective_end=row.get("EFFECTIVE_END").date() if row.get("EFFECTIVE_END") is not None else None,
                         retrieved_period=retrieved_period,
                     )
                     batch_records.append(record)
@@ -500,10 +502,17 @@ class RBICSProvider(DataProcessor):
                     retrieved_period = WolfPeriod.from_day(datetime.now(timezone.utc).date())
                     
                     revenue_share = None
-                    if segment_type == SegmentType.REVENUE and 'REVENUE_SHARE' in row:
-                        revenue_share = row.get("REVENUE_SHARE")
+                    if segment_type == SegmentType.REVENUE and 'SEG_SHARE' in row:
+                        revenue_share = row.get("SEG_SHARE")
                         if pd.notna(revenue_share):
                             revenue_share = float(revenue_share)
+                    
+                    # RBICSのL6 IDを適切に取得
+                    rbics_l6_id = None
+                    if segment_type == SegmentType.REVENUE:
+                        rbics_l6_id = row.get("REVENUE_L6_ID")
+                    else:
+                        rbics_l6_id = row.get("RBICS_L6_ID")
                     
                     record = RBICSCompanyRecord(
                         company_id=row.get("COMPANY_ID"),
@@ -517,11 +526,11 @@ class RBICSProvider(DataProcessor):
                         region_code=row.get("REGION_CODE"),
                         hq_region_code=row.get("HQ_REGION_CODE"),
                         segment_type=segment_type,
-                        rbics_l6_id=row.get("RBICS_L6_ID"),
+                        rbics_l6_id=rbics_l6_id,
                         segment_id=row.get("SEGMENT_ID") if segment_type == SegmentType.REVENUE else None,
                         segment_name=row.get("SEGMENT_NAME") if segment_type == SegmentType.REVENUE else None,
                         revenue_share=revenue_share,
-                        period_end_date=pd.to_datetime(row.get("PERIOD_END_DATE")).date() if pd.notna(row.get("PERIOD_END_DATE")) else None,
+                        period_end_date=row.get("PERIOD_END_DATE").date() if row.get("PERIOD_END_DATE") is not None else None,
                         retrieved_period=retrieved_period,
                     )
                     batch_records.append(record)
