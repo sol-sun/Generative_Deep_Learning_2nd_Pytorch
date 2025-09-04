@@ -458,4 +458,3 @@ __all__ = [
     "RBICSStructureRecord",
     "RBICSCompanyRecord",
 ]
-

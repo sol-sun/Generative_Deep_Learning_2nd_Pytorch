@@ -9,7 +9,6 @@ RBICS プロバイダー用クエリパラメーター
 
 使用例:
     from data_providers.sources.rbics.query_params import (
-        RBICSQueryParams,
         RBICSStructureQueryParams,
         RBICSCompanyQueryParams,
     )
@@ -121,7 +120,7 @@ class RBICSCompanyQueryParams(BaseModel):
     entity_ids: Optional[List[str]] = Field(
         default=None,
         description="エンティティIDリスト",
-        examples=[["001C7F-E", "002D8G-F"]]
+        #examples=[[]]
     )
     company_names: Optional[List[str]] = Field(
         default=None,
@@ -130,10 +129,10 @@ class RBICSCompanyQueryParams(BaseModel):
     )
     
     # 期間設定
-    period_range: Optional[WolfPeriodRange] = Field(
+    period: Optional[WolfPeriod] = Field(
         default=None,
-        description="期間範囲（WolfPeriodRange）",
-        examples=["2020M1:2023M12"]
+        description="期間（WolfPeriod）",
+        examples=["2023Q4", "2023-12"]
     )
     fiscal_years: Optional[List[int]] = Field(
         default=None,
@@ -231,95 +230,10 @@ class RBICSCompanyQueryParams(BaseModel):
         
         return normalized_codes if normalized_codes else None
     
-    @field_serializer("period_range")
-    def _serialize_period_range(self, period_range: Optional[WolfPeriodRange]) -> Optional[Dict[str, Any]]:
-        """WolfPeriodRangeをシリアライズ"""
-        return period_range.model_dump() if period_range else None
-
-
-
-class RBICSQueryParams(BaseModel):
-    """統合RBICS用クエリパラメーター（後方互換性のため）"""
-    
-    model_config = ConfigDict(
-        frozen=True,
-        str_strip_whitespace=True,
-        validate_assignment=True,
-        arbitrary_types_allowed=True,
-        use_enum_values=True,
-        extra="forbid",
-    )
-    
-    # 基本設定
-    segment_type: Optional[SegmentType] = Field(
-        default=None,
-        description="セグメントタイプ",
-        examples=[SegmentType.REVENUE]
-    )
-    entity_ids: Optional[List[str]] = Field(
-        default=None,
-        description="エンティティIDリスト",
-        examples=[["001C7F-E", "002D8G-F"]]
-    )
-    
-    # 期間設定
-    period_range: Optional[WolfPeriodRange] = Field(
-        default=None,
-        description="期間範囲（WolfPeriodRange）",
-        examples=["2020M1:2023M12"]
-    )
-    fiscal_years: Optional[List[int]] = Field(
-        default=None,
-        description="会計年度リスト",
-        examples=[[2020, 2021, 2022, 2023]]
-    )
-    
-    # RBICSフィルター
-    rbics_level: Optional[RBICSLevel] = Field(
-        default=None,
-        description="RBICSレベル",
-        examples=[RBICSLevel.L6]
-    )
-    rbics_codes: Optional[List[str]] = Field(
-        default=None,
-        description="RBICSコードリスト",
-        examples=[["101010101010"]]
-    )
-    
-    # パフォーマンス設定
-    batch_size: int = Field(
-        default=5000,
-        description="バッチサイズ"
-    )
-    max_workers: int = Field(
-        default=4,
-        description="最大ワーカー数"
-    )
-    
-    def to_structure_query(self) -> RBICSStructureQueryParams:
-        """構造クエリに変換"""
-        return RBICSStructureQueryParams(
-            rbics_levels=[self.rbics_level] if self.rbics_level else None,
-            rbics_codes=self.rbics_codes
-        )
-    
-    def to_company_query(self) -> RBICSCompanyQueryParams:
-        """企業クエリに変換"""
-        return RBICSCompanyQueryParams(
-            entity_ids=self.entity_ids,
-            period_range=self.period_range,
-            fiscal_years=self.fiscal_years,
-            segment_types=[self.segment_type] if self.segment_type else None,
-            rbics_levels=[self.rbics_level] if self.rbics_level else None,
-            rbics_codes=self.rbics_codes,
-            batch_size=self.batch_size,
-            max_workers=self.max_workers
-        )
-    
-    @field_serializer("period_range")
-    def _serialize_period_range(self, period_range: Optional[WolfPeriodRange]) -> Optional[Dict[str, Any]]:
-        """WolfPeriodRangeをシリアライズ"""
-        return period_range.model_dump() if period_range else None
+    @field_serializer("period")
+    def _serialize_period(self, period: Optional[WolfPeriod]) -> Optional[Dict[str, Any]]:
+        """WolfPeriodをシリアライズ"""
+        return period.model_dump() if period else None
 
 
 # よく使用されるクエリのプリセット

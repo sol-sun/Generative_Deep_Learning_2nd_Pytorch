@@ -11,12 +11,13 @@ RBICSデータプロバイダー
 - `RBICSProvider`: 取得・整形・最適化を担う高水準API
 - `RBICSStructureRecord`: RBICS構造マスタのPydanticモデル
 - `RBICSCompanyRecord`: 企業RBICS情報のPydanticモデル
-- `RBICSQueryParams`: フィルタ、期間、性能チューニングを表すクエリモデル
+- `RBICSCompanyQueryParams`: フィルタ、期間、性能チューニングを表すクエリモデル
 
 使用例
     from data_providers.sources.rbics.provider import RBICSProvider
     from data_providers.sources.rbics.types import SegmentType
     from wolf_period import WolfPeriod
+    from datetime import date
 
     # プロバイダーの初期化
     provider = RBICSProvider(max_workers=4)
@@ -42,7 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from wolf_period import WolfPeriod, WolfPeriodRange
-from gppm.utils.config_manager import get_logger
+from gppm.core.config_manager import get_logger
 from data_providers.core.base_provider import BaseProvider
 # RBICS固有の型定義をインポート
 from .types import (
@@ -50,7 +51,7 @@ from .types import (
     RBICSStructureRecord,
     RBICSCompanyRecord,
 )
-from .query_params import RBICSQueryParams
+from .query_params import RBICSCompanyQueryParams
 
 logger = get_logger(__name__)
 
@@ -101,8 +102,8 @@ class RBICSProvider(BaseProvider):
         if hasattr(self, '_executor'):
             self._executor.shutdown(wait=False)
     
-    def _normalize_query_params(self, params: Optional[RBICSQueryParams], kwargs: Dict[str, Any]) -> RBICSQueryParams:
-        """ユーザフレンドリーなキーワードをRBICSQueryParamsへ正規化。"""
+    def _normalize_query_params(self, params: Optional[RBICSCompanyQueryParams], kwargs: Dict[str, Any]) -> RBICSCompanyQueryParams:
+        """ユーザフレンドリーなキーワードをRBICSCompanyQueryParamsへ正規化。"""
         if params is not None and kwargs:
             raise ValueError("Use either 'params' or keyword arguments, not both.")
         if params is not None:
@@ -132,11 +133,11 @@ class RBICSProvider(BaseProvider):
         if "segment_types" in uf and isinstance(uf["segment_types"], (str, SegmentType)):
             uf["segment_types"] = [uf["segment_types"]]
         
-        return RBICSQueryParams.model_validate(uf)
+        return RBICSCompanyQueryParams.model_validate(uf)
 
     def get_structure_records(
         self,
-        params: Optional[RBICSQueryParams] = None,
+        params: Optional[RBICSCompanyQueryParams] = None,
         /,
         **kwargs: Any,
     ) -> List[RBICSStructureRecord]:
@@ -157,7 +158,7 @@ class RBICSProvider(BaseProvider):
     
     def get_company_records(
         self,
-        params: Optional[RBICSQueryParams] = None,
+        params: Optional[RBICSCompanyQueryParams] = None,
         /,
         **kwargs: Any,
     ) -> List[RBICSCompanyRecord]:
@@ -188,37 +189,25 @@ class RBICSProvider(BaseProvider):
         logger.info("RBICS企業データ取得完了: 取得件数=%d", len(all_records))
         return all_records
     
-    def _extract_period_info(self, params: RBICSQueryParams) -> Tuple[Optional[WolfPeriod], Optional[WolfPeriodRange]]:
+    def _extract_period_info(self, params: RBICSCompanyQueryParams) -> Tuple[Optional[WolfPeriod], Optional[WolfPeriodRange]]:
         """統一されたperiodパラメータから期間情報を抽出。"""
         period = params.period
         
         if period is None:
-            if params.period_start or params.period_end:
-                start = params.period_start
-                end = params.period_end
-                if start and end:
-                    return None, WolfPeriodRange(start, end)
-                elif start:
-                    return start, None
-                elif end:
-                    return end, None
-            return None, None
+            # 指定がない場合は最新のデータを取得
+            current_date = datetime.now(timezone.utc).date()
+            return WolfPeriod.from_day(current_date), None
         
         if isinstance(period, WolfPeriod):
             return period, None
-        elif isinstance(period, WolfPeriodRange):
-            return None, period
         else:
             raise ValueError(f"サポートされていないperiod形式: {type(period)}")
 
-    def _convert_period_to_sql_conditions(self, params: RBICSQueryParams) -> Tuple[str, str]:
+    def _convert_period_to_sql_conditions(self, params: RBICSCompanyQueryParams) -> Tuple[str, str]:
         """期間パラメータをSQL条件文字列に変換。"""
-        single_period, period_range = self._extract_period_info(params)
+        single_period, _ = self._extract_period_info(params)
         
-        if period_range:
-            start_date = period_range.start.start_date
-            end_date = period_range.stop.end_date if period_range.stop else period_range.start.end_date
-        elif single_period:
+        if single_period:
             start_date = single_period.start_date
             end_date = single_period.end_date
         else:
@@ -230,7 +219,7 @@ class RBICSProvider(BaseProvider):
         
         return start_str, end_str
     
-    def _query_structure_data(self, params: RBICSQueryParams) -> pd.DataFrame:
+    def _query_structure_data(self, params: RBICSCompanyQueryParams) -> pd.DataFrame:
         """RBICS構造マスタデータを取得。"""
         start_condition, end_condition = self._convert_period_to_sql_conditions(params)
         
@@ -267,7 +256,7 @@ class RBICSProvider(BaseProvider):
             logger.error(f"RBICS構造マスタ取得エラー: {e}")
             raise
     
-    def _query_revenue_segment_data(self, params: RBICSQueryParams) -> pd.DataFrame:
+    def _query_revenue_segment_data(self, params: RBICSCompanyQueryParams) -> pd.DataFrame:
         """売上セグメントデータを取得。"""
         start_condition, end_condition = self._convert_period_to_sql_conditions(params)
         
@@ -361,7 +350,7 @@ class RBICSProvider(BaseProvider):
             logger.error(f"RBICS売上セグメント取得エラー: {e}")
             raise
     
-    def _query_focus_segment_data(self, params: RBICSQueryParams) -> pd.DataFrame:
+    def _query_focus_segment_data(self, params: RBICSCompanyQueryParams) -> pd.DataFrame:
         """フォーカスセグメントデータを取得。"""
         start_condition, end_condition = self._convert_period_to_sql_conditions(params)
         
