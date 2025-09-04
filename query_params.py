@@ -11,6 +11,7 @@ RBICS プロバイダー用クエリパラメーター
     from data_providers.sources.rbics.query_params import (
         RBICSStructureQueryParams,
         RBICSCompanyQueryParams,
+        RBICSQueryParams,
     )
 """
 
@@ -232,6 +233,113 @@ class RBICSCompanyQueryParams(BaseModel):
     
     @field_serializer("period")
     def _serialize_period(self, period: Optional[WolfPeriod]) -> Optional[Dict[str, Any]]:
+        """WolfPeriodをシリアライズ"""
+        return period.model_dump() if period else None
+
+
+class RBICSQueryParams(BaseModel):
+    """RBICS クエリパラメータ（WolfPeriod対応）。
+
+    目的:
+    - 取得対象（企業/分類/地域）と期間を安全に指定
+    - データベースアクセスの安全性と性能を確保
+    """
+    
+    model_config = ConfigDict(
+        frozen=True,
+        str_strip_whitespace=True,
+        validate_assignment=True,
+        arbitrary_types_allowed=True,
+        use_enum_values=True,
+        extra="forbid",
+    )
+    
+    # 企業フィルタ
+    factset_entity_ids: Optional[List[str]] = Field(
+        default=None,
+        description="FactSet Entity IDリスト",
+        examples=[["001C7F-E", "002D8G-F"]]
+    )
+    
+    # 証券識別子フィルタ
+    security_ids: Optional[List[str]] = Field(
+        default=None,
+        description="証券識別子リスト",
+        examples=[["US0378331005", "037833100"]]
+    )
+    identifier_type: str = Field(
+        default="isin",
+        description="識別子タイプ",
+        examples=["isin", "cusip", "sedol", "ticker"]
+    )
+    
+    # セグメントフィルタ
+    segment_types: Optional[List[SegmentType]] = Field(
+        default=None,
+        description="セグメントタイプリスト",
+        examples=[[SegmentType.REVENUE, SegmentType.FOCUS]]
+    )
+    include_revenue_segments: bool = Field(
+        default=True,
+        description="売上セグメントを含むかどうか"
+    )
+    include_focus_segments: bool = Field(
+        default=True,
+        description="フォーカスセグメントを含むかどうか"
+    )
+    
+    # 期間フィルタ
+    period: Optional[WolfPeriod] = Field(
+        default=None,
+        description="期間（WolfPeriod）",
+        examples=["2023Q4", "2023-12"]
+    )
+    as_of_date: Optional[date] = Field(
+        default=None,
+        description="基準日",
+        examples=[date(2023, 12, 31)]
+    )
+    period_start: Optional[WolfPeriod] = Field(
+        default=None,
+        description="開始期間（WolfPeriod）",
+        examples=["2020M1"]
+    )
+    period_end: Optional[WolfPeriod] = Field(
+        default=None,
+        description="終了期間（WolfPeriod）",
+        examples=["2023M12"]
+    )
+    
+    # 地域フィルタ
+    region_codes: Optional[List[str]] = Field(
+        default=None,
+        description="地域コードリスト",
+        examples=[["US", "JP", "GB"]]
+    )
+    
+    # データ品質フィルタ
+    min_revenue_share: Optional[float] = Field(
+        default=None,
+        description="最小売上シェア",
+        examples=[0.05]
+    )
+    exclude_zero_revenue: bool = Field(
+        default=True,
+        description="売上ゼロのレコードを除外"
+    )
+    
+    # パフォーマンス設定
+    batch_size: int = Field(
+        default=5000,
+        description="バッチサイズ"
+    )
+    max_workers: int = Field(
+        default=4,
+        description="最大ワーカー数"
+    )
+    
+    @field_serializer("period", "period_start", "period_end")
+    def _serialize_periods(self, period: Optional[WolfPeriod]) -> Optional[Dict[str, Any]]:
         """WolfPeriodをシリアライズ"""
         return period.model_dump() if period else None
 
