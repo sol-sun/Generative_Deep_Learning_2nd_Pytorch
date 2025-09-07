@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 from gppm.utils.country_code_manager import get_country_name, convert_to_alpha2
-from gppm.utils.config_manager import get_logger
+from gppm.core.config_manager import get_logger
 from gppm.utils.country_risk_parameters import CountryRiskParams
 
 # ロギング設定

@@ -126,7 +126,7 @@ def get_specific_company_data(entity_id: str = None):
 
 
 def clean_geographic_data(text_list: List[str]):
-    from gppm.finance.geographic_processor import GeographicProcessor
+    from gppm.utils.geographic_processor import GeographicProcessor
 
     geo_processor = GeographicProcessor()
     return [geo_processor.remove_geographic_info(text) for text in text_list]

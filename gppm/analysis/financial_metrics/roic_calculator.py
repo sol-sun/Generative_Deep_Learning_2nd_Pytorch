@@ -7,7 +7,6 @@ ROIC計算クラス
 from typing import Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
-import warnings
 
 
 class ROICCalculator:

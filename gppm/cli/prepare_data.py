@@ -26,8 +26,8 @@
 
 import yaml
 from pathlib import Path
-from gppm.bayes.bayesian_data_processor import BayesianDataProcessor
-from gppm.pipeline.data_manager import FactSetDataManager
+from gppm.analysis.bayesian.data_processor import BayesianDataProcessor
+from gppm.core.data_manager import FactSetDataManager
 
 
 def load_config(config_path: str = "gppm_config.yml") -> dict:

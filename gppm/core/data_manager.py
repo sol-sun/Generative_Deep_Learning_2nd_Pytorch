@@ -10,12 +10,13 @@ import numpy as np
 import warnings
 from datetime import datetime, timezone, date
 
-from data_providers.data_sources.factset.provider import FactSetProvider
-from data_providers.data_sources.segment.provider import SegmentDataProvider
-from data_providers.data_sources.revere.provider import RevereDataProvider
-from data_providers.data_sources.rbics.provider import RBICSProvider
-from data_providers.data_sources.rbics.types import RBICSQueryParams, RBICSStructureRecord
-from gppm.analysis.geographic.region_analysis import GeographicProcessor
+from data_providers.sources.factset.provider import FactSetProvider
+from data_providers.sources.segment.provider import SegmentDataProvider
+from data_providers.sources.revere.provider import RevereDataProvider
+from data_providers.sources.rbics.provider import RBICSProvider
+from data_providers.sources.rbics.types import RBICSStructureRecord
+from data_providers.sources.rbics.query_params import RBICSQueryParams
+from gppm.utils.geographic_processor import GeographicProcessor
 from data_providers.core.base_provider import BaseProvider
 from gppm.core.config_manager import get_logger
 from wolf_period import WolfPeriod

@@ -16,11 +16,10 @@ import time
 from gppm.core.data_manager import FactSetDataManager
 from gppm.analysis.financial_metrics.roic_calculator import ROICCalculator
 from gppm.analysis.risk_capital.wacc_calculator import WACCCalculator, WACCColumnConfig
-from data_providers.utils.country_risk_parameters import CountryRiskParams
+from gppm.utils.country_risk_parameters import CountryRiskParams, get_country_risk_manager
 from gppm.analysis.financial_metrics.product_score_calculator import ProductScoreCalculator
 from gppm.utils.geographic_processor import GeographicProcessor
 from gppm.utils.country_code_manager import get_country_name
-from data_providers.utils.country_risk_parameters import get_country_risk_manager
 from gppm.core.config_manager import get_logger
 
 # 既存の資産を使用してロガーを取得

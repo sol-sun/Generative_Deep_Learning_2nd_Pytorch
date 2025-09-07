@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import pandas as pd
 import numpy as np
 import gc
-from gppm.finance.geographic_processor import GeographicProcessor
+from gppm.utils.geographic_processor import GeographicProcessor
 
 
 class ProductScoreCalculator:
