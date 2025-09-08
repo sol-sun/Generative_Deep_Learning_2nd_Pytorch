@@ -1,27 +1,31 @@
 """
-最適化されたCSVからPKL生成コード
-巨大なCSVファイルからPKLファイルを効率的に生成するための最適化実装
+CSV処理と変分推論結果統合ツール
+巨大なCSVファイルを効率的に処理し、変分推論結果と統合するツール
 
 主な機能:
 - 巨大なCSVファイルの効率的な処理
-- ベイズ結果の読み込みと統合
+- 変分推論結果の読み込みと統合
 - 設定ファイルからの設定読み込み
 - 並列処理による高速化
 - エラーハンドリングとログ機能
 
 使用方法:
-1. 設定ファイル (gppm_config.yml) でベイズ結果のパスを設定
-2. CSVToPKLProcessor を初期化
-3. process_with_bayesian_integration() で統合処理を実行
+1. 設定ファイル (gppm_config.yml) で変分推論結果のパスと出力設定を設定
+2. CSVProcessor を初期化（ConfigManagerを使用）
+3. process_csv_with_variational_integration() で統合処理を実行
 
 例:
-    from gppm.cli.csv_to_pkl_optimized import CSVToPKLProcessor, ProcessingConfig
+    from gppm.cli.csv_to_pkl_optimized import CSVProcessor
+    from gppm.core.config_manager import ConfigManager
     
-    config = ProcessingConfig(config_file_path="gppm_config.yml")
-    processor = CSVToPKLProcessor(config)
-    results = processor.process_with_bayesian_integration(
+    # ConfigManagerを使用して設定を読み込み
+    config_manager = ConfigManager()
+    processor = CSVProcessor(config_manager=config_manager)
+    
+    # 統合処理の実行（出力パスは設定ファイルから自動取得）
+    results = processor.process_csv_with_variational_integration(
         csv_path="input.csv",
-        out_path="output.pkl"
+        out_path="output.pkl"  # 設定ファイルの出力設定を使用する場合は任意
     )
 """
 
@@ -38,6 +42,8 @@ from tqdm import tqdm
 import yaml
 import pickle
 
+from gppm.core.config_manager import ConfigManager, get_logger
+
 
 @dataclass
 class ProcessingConfig:
@@ -53,109 +59,122 @@ class ProcessingConfig:
     bayesian_result_path: Optional[str] = None
     bayesian_output_dir: Optional[str] = None
     config_file_path: Optional[str] = None
+    
+    @classmethod
+    def from_config_manager(cls, config_manager: ConfigManager) -> 'ProcessingConfig':
+        """ConfigManagerから設定を読み込んでProcessingConfigを作成"""
+        config = config_manager.get_config()
+        
+        # データ処理設定を取得
+        data_processing_config = config.data_processing
+        
+        # 変分推論設定を取得
+        variational_config = config.variational_inference
+        
+        return cls(
+            chunk_size=1000,  # デフォルト値
+            max_workers=data_processing_config.parallel_workers,
+            memory_limit_mb=data_processing_config.memory_limit_mb,
+            dtype=data_processing_config.data_type,
+            engine='c',  # デフォルト値
+            comment_char='#',  # デフォルト値
+            skip_blank_lines=True,  # デフォルト値
+            bayesian_result_path=variational_config.existing_result_path,
+            bayesian_output_dir=config.output.directory,
+            config_file_path=config_manager.config_file_path
+        )
 
 
 @dataclass
 class BayesianConfig:
-    """ベイズ推論設定を管理するデータクラス"""
+    """変分推論設定を管理するデータクラス"""
     result_path: str
     output_dir: str
     model: Dict[str, Any]
     variational: Dict[str, Any]
 
 
-class CSVToPKLProcessor:
-    """CSVからPKLへの変換処理を管理するクラス"""
+class CSVProcessor:
+    """CSV処理と変分推論結果統合を管理するクラス"""
     
-    def __init__(self, config: Optional[ProcessingConfig] = None):
+    def __init__(self, config: Optional[ProcessingConfig] = None, config_manager: Optional[ConfigManager] = None):
         """
         初期化
         
         Args:
-            config: 処理設定。Noneの場合はデフォルト設定を使用
+            config: 処理設定。Noneの場合はConfigManagerから読み込み
+            config_manager: 設定管理オブジェクト。Noneの場合は新規作成
         """
-        self.config = config or ProcessingConfig()
-        self.logger = self._setup_logger()
-        self.bayesian_config = self._load_bayesian_config()
+        if config is None:
+            if config_manager is None:
+                config_manager = ConfigManager()
+            self.config = ProcessingConfig.from_config_manager(config_manager)
+            self.config_manager = config_manager
+        else:
+            self.config = config
+            self.config_manager = config_manager or ConfigManager()
         
-    def _setup_logger(self) -> logging.Logger:
-        """ログ設定"""
-        logger = logging.getLogger(__name__)
-        if not logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
-        return logger
+        self.logger = get_logger(__name__)
+        self.bayesian_config = self._load_bayesian_config()
     
     def _load_bayesian_config(self) -> Optional[BayesianConfig]:
         """
-        設定ファイルからベイズ設定を読み込み
+        ConfigManagerから変分推論設定を読み込み
         
         Returns:
-            ベイズ設定オブジェクト。設定ファイルが存在しない場合はNone
+            変分推論設定オブジェクト。設定が存在しない場合はNone
         """
-        config_path = self.config.config_file_path or "gppm_config.yml"
-        
         try:
-            if Path(config_path).exists():
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config_data = yaml.safe_load(f)
-                
-                bayesian_data = config_data.get('bayesian', {})
-                if bayesian_data:
-                    return BayesianConfig(
-                        result_path=bayesian_data.get('result_path', ''),
-                        output_dir=bayesian_data.get('output_dir', ''),
-                        model=bayesian_data.get('model', {}),
-                        variational=bayesian_data.get('variational', {})
-                    )
-            else:
-                self.logger.warning(f"設定ファイルが見つかりません: {config_path}")
+            config = self.config_manager.get_config()
+            variational_config = config.variational_inference
+            
+            return BayesianConfig(
+                result_path=variational_config.existing_result_path,
+                output_dir=config.output.directory,
+                model=variational_config.new_inference.__dict__,
+                variational=variational_config.new_inference.__dict__
+            )
                 
         except Exception as e:
-            self.logger.error(f"ベイズ設定の読み込みに失敗: {e}")
+            self.logger.error(f"変分推論設定の読み込みに失敗: {e}")
         
         return None
     
     def load_bayesian_result(self, result_path: Optional[str] = None) -> Optional[pd.Series]:
         """
-        ベイズ結果を読み込み
+        変分推論結果を読み込み
         
         Args:
-            result_path: ベイズ結果ファイルのパス。Noneの場合は設定から取得
+            result_path: 変分推論結果ファイルのパス。Noneの場合は設定から取得
             
         Returns:
-            ベイズ結果のSeries。読み込みに失敗した場合はNone
+            変分推論結果のSeries。読み込みに失敗した場合はNone
         """
         if result_path is None:
             if self.bayesian_config is None:
-                self.logger.error("ベイズ設定が読み込まれていません")
+                self.logger.error("変分推論設定が読み込まれていません")
                 return None
             result_path = self.bayesian_config.result_path
         
         try:
             result_path = Path(result_path)
             if not result_path.exists():
-                self.logger.error(f"ベイズ結果ファイルが見つかりません: {result_path}")
+                self.logger.error(f"変分推論結果ファイルが見つかりません: {result_path}")
                 return None
             
-            self.logger.info(f"ベイズ結果を読み込み中: {result_path}")
+            self.logger.info(f"変分推論結果を読み込み中: {result_path}")
             with open(result_path, 'rb') as f:
                 result = pickle.load(f)
             
             if isinstance(result, pd.Series):
-                self.logger.info(f"ベイズ結果読み込み完了: {len(result)} 要素")
+                self.logger.info(f"変分推論結果読み込み完了: {len(result)} 要素")
                 return result
             else:
-                self.logger.error(f"ベイズ結果の形式が不正です: {type(result)}")
+                self.logger.error(f"変分推論結果の形式が不正です: {type(result)}")
                 return None
                 
         except Exception as e:
-            self.logger.error(f"ベイズ結果の読み込みに失敗: {e}")
+            self.logger.error(f"変分推論結果の読み込みに失敗: {e}")
             return None
     
     def _validate_inputs(self, csv_path: Union[str, Path], out_path: Union[str, Path]) -> None:
@@ -359,21 +378,21 @@ class CSVToPKLProcessor:
         
         return final_result
     
-    def process_with_bayesian_integration(
+    def process_csv_with_variational_integration(
         self,
         csv_path: Union[str, Path],
         out_path: Union[str, Path],
-        bayesian_result_path: Optional[str] = None,
+        variational_result_path: Optional[str] = None,
         num_chunks: Optional[int] = None,
         show_progress: bool = True
     ) -> Dict[str, pd.Series]:
         """
-        CSV処理とベイズ結果の統合処理
+        CSV処理と変分推論結果の統合処理
         
         Args:
             csv_path: 入力CSVファイルのパス
             out_path: 出力PKLファイルのパス
-            bayesian_result_path: ベイズ結果ファイルのパス
+            variational_result_path: 変分推論結果ファイルのパス
             num_chunks: 処理チャンク数
             show_progress: 進捗表示の有無
             
@@ -382,21 +401,27 @@ class CSVToPKLProcessor:
         """
         results = {}
         
-        # ベイズ結果の読み込み
-        bayesian_result = self.load_bayesian_result(bayesian_result_path)
-        if bayesian_result is not None:
-            results['bayesian'] = bayesian_result
-            self.logger.info("ベイズ結果を統合処理に含めます")
+        # 変分推論結果の読み込み
+        variational_result = self.load_bayesian_result(variational_result_path)
+        if variational_result is not None:
+            results['variational'] = variational_result
+            self.logger.info("変分推論結果を統合処理に含めます")
         
         # CSV処理実行
         csv_result = self.process_csv_to_pkl(csv_path, out_path, num_chunks, show_progress)
         results['csv_processed'] = csv_result
         
         # 統合結果の保存
-        if bayesian_result is not None and not csv_result.empty:
-            # ベイズ結果とCSV結果を統合
-            integrated_result = pd.concat([bayesian_result, csv_result], axis=0)
-            integrated_path = Path(out_path).with_suffix('.integrated.pkl')
+        if variational_result is not None and not csv_result.empty:
+            # 変分推論結果とCSV結果を統合
+            integrated_result = pd.concat([variational_result, csv_result], axis=0)
+            
+            # 設定ファイルから統合結果の出力パスを取得
+            config = self.config_manager.get_config()
+            output_dir = Path(config.output.directory)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            integrated_path = output_dir / config.output.files.integrated
+            
             integrated_result.to_pickle(integrated_path)
             results['integrated'] = integrated_result
             self.logger.info(f"統合結果を保存: {integrated_path}")
@@ -406,24 +431,24 @@ class CSVToPKLProcessor:
 
 def main():
     """メイン実行関数"""
-    # 設定
-    config = ProcessingConfig(
-        chunk_size=1000,
-        max_workers=4,
-        memory_limit_mb=2048,
-        config_file_path="gppm_config.yml"
-    )
+    # ConfigManagerを使用して設定を読み込み
+    config_manager = ConfigManager()
+    config = config_manager.get_config()
     
-    # プロセッサー初期化
-    processor = CSVToPKLProcessor(config)
+    # プロセッサー初期化（ConfigManagerから設定を自動読み込み）
+    processor = CSVProcessor(config_manager=config_manager)
     
-    # ファイルパス（例）
+    # 設定ファイルから出力パスを取得
+    output_dir = Path(config.output.directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ファイルパス（例 - 実際の使用時は設定ファイルまたはコマンドライン引数で指定）
     csv_path = '/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202505/item_roic_rbics/result/Item_ROIC_Item_Beta-20250627033115.csv'
-    out_path = '/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202505/stan_result_15_usd2_optimized.pkl'
+    out_path = output_dir / config.output.files.csv_processed
     
     try:
         # 統合処理の実行
-        results = processor.process_with_bayesian_integration(csv_path, out_path)
+        results = processor.process_csv_with_variational_integration(csv_path, out_path)
         
         # 結果の表示
         for key, result in results.items():

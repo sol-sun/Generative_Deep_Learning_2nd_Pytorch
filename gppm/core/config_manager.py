@@ -191,6 +191,169 @@ class OutputConfig(BaseModel):
         return Path(v) if isinstance(v, str) else v
 
 
+class BayesianModelConfig(BaseModel):
+    """ベイズ推論モデル設定。
+
+    概要:
+    - Stanモデルファイルとサンプリングパラメータを管理します。
+    - ベイズ推論の実行に必要な設定を提供します。
+
+    特徴:
+    - Stanモデルファイルパスの管理
+    - サンプリングパラメータの設定
+    - 乱数シードの管理
+    """
+    stan_file: Optional[Path] = Field(
+        default=None,
+        description="Stanモデルファイルのパス",
+        examples=["/path/to/model.stan", "./models/bayesian_model.stan"]
+    )
+    iter_sampling: int = Field(
+        default=1000,
+        gt=0,
+        description="サンプリング反復数",
+        examples=[1000, 2000, 5000]
+    )
+    chains: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="チェーン数",
+        examples=[1, 4, 8]
+    )
+    seed: int = Field(
+        default=42,
+        description="乱数シード",
+        examples=[42, 123, 456]
+    )
+    
+    @field_validator('stan_file', mode='before')
+    @classmethod
+    def convert_stan_file_to_path(cls, v) -> Optional[Path]:
+        """StanファイルパスをPathオブジェクトに変換。
+
+        Args:
+            v: 変換対象の値（文字列またはPathオブジェクト）
+
+        Returns:
+            変換後のPathオブジェクト（Noneの場合はNone）
+        """
+        return Path(v) if isinstance(v, str) and v else v
+
+
+class BayesianVariationalConfig(BaseModel):
+    """ベイズ変分推論設定。
+
+    概要:
+    - 変分推論のパラメータを管理します。
+    - 変分推論の実行に必要な設定を提供します。
+
+    特徴:
+    - 変分推論のパラメータ設定
+    - 収束条件の管理
+    - 乱数シードの管理
+    """
+    draws: int = Field(
+        default=2000,
+        gt=0,
+        description="変分推論の描画数",
+        examples=[1000, 2000, 5000]
+    )
+    iter: int = Field(
+        default=500000,
+        gt=0,
+        description="変分推論の反復数",
+        examples=[100000, 500000, 1000000]
+    )
+    seed: int = Field(
+        default=1234,
+        description="変分推論の乱数シード",
+        examples=[1234, 5678, 9999]
+    )
+    require_converged: bool = Field(
+        default=False,
+        description="収束を要求するかどうか",
+        examples=[True, False]
+    )
+
+
+class BayesianConfig(BaseModel):
+    """ベイズ推論設定。
+
+    概要:
+    - ベイズ推論全般の設定を管理します。
+    - 推論エンジン、モデル、変分推論の設定を統合します。
+
+    特徴:
+    - 推論エンジンの選択
+    - モデル設定の管理
+    - 変分推論設定の管理
+    - 結果ファイルパスの管理
+    """
+    result_path: Optional[Path] = Field(
+        default=None,
+        description="ベイズ結果ファイルのパス",
+        examples=["/path/to/result.pkl", "./results/bayesian_result.pkl"]
+    )
+    output_dir: Path = Field(
+        default=Path("/tmp/gppm_output/bayesian_results"),
+        description="ベイズ結果の出力ディレクトリ",
+        examples=["/tmp/gppm_output/bayesian_results", "./output/bayesian"]
+    )
+    engine: str = Field(
+        default="cmdstanpy",
+        description="推論エンジンの種類",
+        examples=["cmdstanpy", "pystan", "numpyro"]
+    )
+    model: BayesianModelConfig = Field(default_factory=BayesianModelConfig)
+    variational: BayesianVariationalConfig = Field(default_factory=BayesianVariationalConfig)
+    
+    @field_validator('result_path', mode='before')
+    @classmethod
+    def convert_result_path_to_path(cls, v) -> Optional[Path]:
+        """結果ファイルパスをPathオブジェクトに変換。
+
+        Args:
+            v: 変換対象の値（文字列またはPathオブジェクト）
+
+        Returns:
+            変換後のPathオブジェクト（Noneの場合はNone）
+        """
+        return Path(v) if isinstance(v, str) and v else v
+    
+    @field_validator('output_dir', mode='before')
+    @classmethod
+    def convert_output_dir_to_path(cls, v) -> Path:
+        """出力ディレクトリパスをPathオブジェクトに変換。
+
+        Args:
+            v: 変換対象の値（文字列またはPathオブジェクト）
+
+        Returns:
+            変換後のPathオブジェクト
+        """
+        return Path(v) if isinstance(v, str) else v
+    
+    @field_validator('engine')
+    @classmethod
+    def validate_engine(cls, v: str) -> str:
+        """推論エンジンの検証。
+
+        Args:
+            v: 検証対象のエンジン名
+
+        Returns:
+            検証済みのエンジン名
+
+        Raises:
+            ValueError: 無効なエンジン名の場合
+        """
+        valid_engines = {'cmdstanpy', 'pystan', 'numpyro'}
+        if v.lower() not in valid_engines:
+            raise ValueError(f'engine must be one of {valid_engines}')
+        return v.lower()
+
+
 class GPPMConfig(BaseSettings):
     """
     GPPM メイン設定クラス（Pydantic Settings対応）。
@@ -252,6 +415,7 @@ class GPPMConfig(BaseSettings):
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    bayesian: BayesianConfig = Field(default_factory=BayesianConfig)
     
     @field_validator('log_level')
     @classmethod
@@ -390,6 +554,19 @@ class GPPMConfig(BaseSettings):
             results['log_directory'] = self.log_file.parent.exists() or self.log_file.parent.parent.exists()
         else:
             results['log_directory'] = True
+        
+        # ベイズ推論関連のパス確認
+        results['bayesian_output_dir'] = self.bayesian.output_dir.exists() or self.bayesian.output_dir.parent.exists()
+        
+        if self.bayesian.result_path:
+            results['bayesian_result_file'] = self.bayesian.result_path.exists()
+        else:
+            results['bayesian_result_file'] = True  # オプショナルなので存在しなくてもOK
+        
+        if self.bayesian.model.stan_file:
+            results['stan_model_file'] = self.bayesian.model.stan_file.exists()
+        else:
+            results['stan_model_file'] = True  # オプショナルなので存在しなくてもOK
         
         return results
     
