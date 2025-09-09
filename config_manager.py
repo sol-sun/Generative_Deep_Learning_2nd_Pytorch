@@ -26,43 +26,28 @@ GPPM設定管理モジュール
 - キャッシュ: 設定インスタンスの再利用
 
 使用例
-    from gppm.utils.config_manager import ConfigManager, get_logger
+    from gppm.core.config_manager import ConfigManager, get_logger
 
     # 設定マネージャーの初期化
     config_manager = ConfigManager()
     config = config_manager.get_config()
 
     # 設定値の取得
-    batch_size = config.processing.batch_size
-    start_period = config.data.start_period
-    output_dir = config.output.base_directory
+    start_period = config.analysis_period.start
+    end_period = config.analysis_period.end
+    output_dir = config.output.directory
+    parallel_workers = config.data_processing.parallel_workers
+    inference_engine = config.variational_inference.inference_config.engine
 
     # ロガーの取得
     logger = get_logger(__name__)
-    logger.info("設定読み込み完了: batch_size=%d", batch_size)
+    logger.info("設定読み込み完了: 期間=%d-%d, ワーカー数=%d", 
+                start_period, end_period, parallel_workers)
 
     # 設定の検証
     validation_results = config_manager.validate_config()
     if not all(validation_results.values()):
         logger.warning("設定検証エラー: %s", validation_results)
-
-設定ファイル例（gppm_config.yml）
-    log_level: INFO
-    log_file: /tmp/gppm.log
-    
-    processing:
-      batch_size: 1000
-      max_workers: 4
-    
-    data:
-      start_period: 201909
-      end_period: 202406
-    
-    output:
-      base_directory: /tmp/gppm_output
-      dataset_filename: bayesian_dataset.pkl
-
-    mapping_df_path: /data/mapping.pkl
 """
 
 import logging
@@ -80,61 +65,27 @@ from pydantic_settings import (
 )
 
 
-class ProcessingConfig(BaseModel):
-    """処理パフォーマンス設定。
+class AnalysisPeriodConfig(BaseModel):
+    """分析期間設定。
 
     概要:
-    - バッチ処理サイズと並列処理ワーカー数を管理します。
-    - データ処理の効率性とリソース使用量のバランスを制御します。
-
-    特徴:
-    - バッチサイズによるメモリ使用量の最適化
-    - 並列処理による計算速度の向上
-    - リソース制約に基づく安全なデフォルト値
-    """
-    batch_size: int = Field(
-        default=1000, 
-        gt=0, 
-        description="バッチサイズ（メモリ使用量と処理速度のバランス）",
-        examples=[100, 1000, 5000]
-    )
-    max_workers: int = Field(
-        default=4, 
-        ge=1, 
-        le=32, 
-        description="最大ワーカー数（並列処理の同時実行数）",
-        examples=[1, 4, 8, 16]
-    )
-
-
-class DataConfig(BaseModel):
-    """データ期間・範囲設定。
-
-    概要:
-    - データ処理対象の期間範囲を管理します。
+    - 分析対象の期間範囲を管理します。
     - YYYYMM形式での期間指定と妥当性検証を提供します。
 
     特徴:
     - 開始期間と終了期間の自動検証
-    - 2000年以降の期間制約
     - 期間の論理的一貫性チェック
     """
-    start_period: int = Field(
-        default=201909, 
-        ge=200001, 
-        le=999912, 
-        description="開始期間（YYYYMM形式、2000年以降）",
+    start: int = Field(
+        description="開始期間（YYYYMM形式）",
         examples=[201909, 202001, 202406]
     )
-    end_period: int = Field(
-        default=202406, 
-        ge=200001, 
-        le=999912, 
-        description="終了期間（YYYYMM形式、2000年以降）",
+    end: int = Field(
+        description="終了期間（YYYYMM形式）",
         examples=[202001, 202406, 202412]
     )
     
-    @field_validator('end_period')
+    @field_validator('end')
     @classmethod
     def validate_end_after_start(cls, v: int, info) -> int:
         """終了期間が開始期間より後であることを検証。
@@ -149,13 +100,37 @@ class DataConfig(BaseModel):
         Raises:
             ValueError: 終了期間が開始期間以前の場合
         """
-        if 'start_period' in info.data and v < info.data['start_period']:
+        if 'start' in info.data and v < info.data['start']:
             raise ValueError('終了期間は開始期間より後でなければなりません。')
         return v
 
 
+class OutputFilesConfig(BaseModel):
+    """出力ファイル設定。
+
+    概要:
+    - 各種出力ファイルの名前を管理します。
+    """
+    variational_result: str = Field(
+        description="変分推論結果ファイル名",
+        examples=["variational_inference_result.pkl"]
+    )
+    dataset: str = Field(
+        description="データセットファイル名",
+        examples=["dataset.pkl"]
+    )
+    csv_processed: str = Field(
+        description="CSV処理結果ファイル名",
+        examples=["csv_processed_result.pkl"]
+    )
+    integrated: str = Field(
+        description="統合結果ファイル名",
+        examples=["integrated_analysis_result.pkl"]
+    )
+
+
 class OutputConfig(BaseModel):
-    """出力パス・ファイル設定。
+    """出力設定。
 
     概要:
     - 処理結果の出力先ディレクトリとファイル名を管理します。
@@ -164,20 +139,16 @@ class OutputConfig(BaseModel):
     特徴:
     - 文字列からPathオブジェクトへの自動変換
     - 出力ディレクトリの存在確認
-    - デフォルト出力先の安全な設定
     """
-    base_directory: Path = Field(
-        default=Path("/tmp/gppm_output"), 
-        description="出力ベースディレクトリ（処理結果の保存先）",
+    directory: Path = Field(
+        description="出力ディレクトリ（処理結果の保存先）",
         examples=["/tmp/gppm_output", "./output", "/data/gppm"]
     )
-    dataset_filename: str = Field(
-        default="bayesian_dataset.pkl", 
-        description="データセットファイル名（出力ファイルの名前）",
-        examples=["bayesian_dataset.pkl", "processed_data.pkl"]
+    files: OutputFilesConfig = Field(
+        description="出力ファイル名設定"
     )
     
-    @field_validator('base_directory', mode='before')
+    @field_validator('directory', mode='before')
     @classmethod
     def convert_to_path(cls, v) -> Path:
         """文字列をPathオブジェクトに変換。
@@ -189,6 +160,87 @@ class OutputConfig(BaseModel):
             変換後のPathオブジェクト
         """
         return Path(v) if isinstance(v, str) else v
+
+
+class InferenceConfig(BaseModel):
+    """変分推論設定。
+
+    概要:
+    - 変分推論によるベイズ分析の設定を管理します。
+    """
+    engine: str = Field(
+        description="推論エンジン",
+        examples=["cmdstanpy", "pymc"]
+    )
+    model_file: Optional[str] = Field(
+        default=None,
+        description="Stanモデルファイル（nullの場合はデフォルトモデル）"
+    )
+    samples: int = Field(
+        description="サンプル数（事後分布からのサンプル数）",
+        examples=[2000, 5000]
+    )
+    optimization_iterations: int = Field(
+        description="最適化反復数（変分推論の最適化回数）",
+        examples=[500000, 1000000]
+    )
+    random_seed: int = Field(
+        description="乱数シード（再現性のため）",
+        examples=[42, 123]
+    )
+    require_convergence: bool = Field(
+        description="収束を要求するか",
+        examples=[True, False]
+    )
+
+
+class VariationalInferenceConfig(BaseModel):
+    """変分推論全体設定。
+
+    概要:
+    - 既存の変分推論結果ファイルと新しい推論設定を管理します。
+    """
+    existing_result_path: Optional[str] = Field(
+        default=None,
+        description="既存の変分推論結果ファイルパス"
+    )
+    inference_config: InferenceConfig = Field(
+        description="新しい変分推論を実行する場合の設定"
+    )
+
+
+class DataProcessingConfig(BaseModel):
+    """データ処理設定。
+
+    概要:
+    - データ処理のパフォーマンス設定を管理します。
+    """
+    parallel_workers: int = Field(
+        description="CSV処理の並列化設定（CPUコア数に応じて調整）",
+        examples=[1, 4, 8]
+    )
+    memory_limit_mb: int = Field(
+        description="メモリ制限（MB）",
+        examples=[1024, 2048, 4096]
+    )
+    data_type: str = Field(
+        description="データ型（メモリ使用量を削減したい場合は'float32'に変更）",
+        examples=["float64", "float32"]
+    )
+
+
+class OptionalDataConfig(BaseModel):
+    """オプションデータ設定。
+
+    概要:
+    - オプションのデータファイルパスを管理します。
+    """
+    mapping_file: Optional[str] = Field(
+        default=None,
+        description="マッピングファイルパス（デフォルト値を使用する場合はnull）"
+    )
+
+
 
 
 class GPPMConfig(BaseSettings):
@@ -225,33 +277,36 @@ class GPPMConfig(BaseSettings):
         validate_default=True,
     )
     
+    # 分析期間設定
+    analysis_period: AnalysisPeriodConfig = Field(
+        description="分析期間設定"
+    )
+    
+    # 出力設定
+    output: OutputConfig = Field(
+        description="出力設定"
+    )
+    
+    # 変分推論設定
+    variational_inference: VariationalInferenceConfig = Field(
+        description="変分推論設定"
+    )
+    
+    # データ処理設定
+    data_processing: DataProcessingConfig = Field(
+        description="データ処理設定"
+    )
+    
     # ログ設定
     log_level: str = Field(
-        default="INFO", 
         description="ログレベル（DEBUG/INFO/WARNING/ERROR/CRITICAL）",
         examples=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
-    log_format: str = Field(
-        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        description="ログメッセージのフォーマット"
-    )
-    log_file: Optional[Path] = Field(
-        default=None, 
-        description="ログファイルパス（指定時はファイル出力を有効化）",
-        examples=["/tmp/gppm.log", "./logs/gppm.log"]
-    )
     
-    # マッピングデータファイルパス
-    mapping_df_path: Optional[Path] = Field(
-        default=None, 
-        description="マッピングデータファイルパス（オプショナル）",
-        examples=["/path/to/mapping_df.pkl", "./data/mapping.pkl"]
+    # オプションデータ設定
+    optional_data: OptionalDataConfig = Field(
+        description="オプションデータ設定"
     )
-    
-    # サブ設定
-    processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
-    data: DataConfig = Field(default_factory=DataConfig)
-    output: OutputConfig = Field(default_factory=OutputConfig)
     
     @field_validator('log_level')
     @classmethod
@@ -285,18 +340,6 @@ class GPPMConfig(BaseSettings):
         """
         return Path(v) if isinstance(v, str) and v else v
     
-    @field_validator('mapping_df_path', mode='before')
-    @classmethod
-    def convert_mapping_path_to_path(cls, v) -> Optional[Path]:
-        """マッピングファイルパスをPathオブジェクトに変換。
-
-        Args:
-            v: 変換対象の値（文字列またはPathオブジェクト）
-
-        Returns:
-            変換後のPathオブジェクト（Noneの場合はNone）
-        """
-        return Path(v) if isinstance(v, str) and v else v
     
     @classmethod
     def settings_customise_sources(
@@ -351,24 +394,11 @@ class GPPMConfig(BaseSettings):
             file_secret_settings,  # シークレットファイル
         )
     
-    def get_output_path(self, filename: Optional[str] = None) -> Path:
-        """出力パスを取得。
-
-        Args:
-            filename: ファイル名（指定時はそのファイルのパス、None時はデフォルトファイル名）
-
-        Returns:
-            出力ファイルの完全パス
-        """
-        if filename:
-            return self.output.base_directory / filename
-        return self.output.base_directory / self.output.dataset_filename
-    
     def validate_paths(self) -> Dict[str, bool]:
         """パスの存在を検証。
 
         概要:
-        - 出力ディレクトリ、マッピングファイル、ログファイルの存在確認
+        - 出力ディレクトリ、マッピングファイルの存在確認
         - ディレクトリ作成可能性の検証
 
         Returns:
@@ -377,19 +407,21 @@ class GPPMConfig(BaseSettings):
         results = {}
         
         # 出力ディレクトリの確認
-        results['output_directory'] = self.output.base_directory.exists() or self.output.base_directory.parent.exists()
+        results['output_directory'] = self.output.directory.exists() or self.output.directory.parent.exists()
         
         # マッピングファイルの確認
-        if self.mapping_df_path:
-            results['mapping_file'] = self.mapping_df_path.exists()
+        if self.optional_data.mapping_file:
+            mapping_path = Path(self.optional_data.mapping_file)
+            results['mapping_file'] = mapping_path.exists()
         else:
             results['mapping_file'] = True  # オプショナルなので存在しなくてもOK
         
-        # ログファイルディレクトリの確認
-        if self.log_file:
-            results['log_directory'] = self.log_file.parent.exists() or self.log_file.parent.parent.exists()
+        # 既存の変分推論結果ファイルの確認
+        if self.variational_inference.existing_result_path:
+            existing_path = Path(self.variational_inference.existing_result_path)
+            results['existing_result_file'] = existing_path.exists()
         else:
-            results['log_directory'] = True
+            results['existing_result_file'] = True  # オプショナルなので存在しなくてもOK
         
         return results
     
@@ -398,19 +430,18 @@ class GPPMConfig(BaseSettings):
 
         概要:
         - gppmロガーの設定を適用
-        - コンソールとファイルの両方にログ出力
+        - コンソールにログ出力
         - 他のライブラリのログレベルを制御
 
         特徴:
         - フォーマッターによる統一されたログ形式
-        - ファイルハンドラーの自動ディレクトリ作成
         - ログレベルの動的設定
         """
         level = getattr(logging, self.log_level, logging.INFO)
         
         # フォーマッター
         formatter = logging.Formatter(
-            fmt=self.log_format,
+            fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S"
         )
         
@@ -425,31 +456,9 @@ class GPPMConfig(BaseSettings):
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
         
-        # ファイルハンドラー（指定時）
-        if self.log_file:
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            file_handler = logging.FileHandler(
-                self.log_file, mode="a", encoding="utf-8"
-            )
-            file_handler.setLevel(level)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-        
         # 他のライブラリのログレベルを制御
         logging.getLogger().setLevel(logging.WARNING)
         logger.propagate = False
-    
-    def model_dump(self, **kwargs) -> Dict[str, Any]:
-        """設定を辞書形式で出力。
-
-        Args:
-            **kwargs: Pydanticのmodel_dumpに渡す引数
-
-        Returns:
-            設定の辞書表現
-        """
-        return super().model_dump(**kwargs)
 
 
 class ConfigManager:
@@ -525,40 +534,13 @@ class ConfigManager:
         if self._config is None:
             with self._lock:
                 if self._config is None:
-                    self._config = self._create_config()
-        return self._config
-    
-    def reset_config(self) -> None:
-        """設定インスタンスをリセット。
-
-        概要:
-        - キャッシュされた設定インスタンスをクリア
-        - 次回get_config()呼び出し時に再初期化
-        """
-        with self._lock:
-            self._config = None
-    
-    def _create_config(self, **overrides) -> GPPMConfig:
-        """設定インスタンスを作成。
-
-        Args:
-            **overrides: 設定値のオーバーライド
-
-        Returns:
-            作成されたGPPMConfigインスタンス
-
-        Raises:
-            FileNotFoundError: 設定ファイルが見つからない場合
-            ValidationError: 設定値の検証に失敗した場合
-            ValueError: 設定作成時のエラー
-        """
-        try:
-            config = GPPMConfig(**overrides)
-            config.setup_logging()
-            return config
-        except (FileNotFoundError, ValueError, ValidationError) as e:
-            print(f"設定エラー: {e}")
-            raise
+                    try:
+                        self._config = GPPMConfig()
+                        self._config.setup_logging()
+                    except (FileNotFoundError, ValueError, ValidationError) as e:
+                        print(f"設定エラー: {e}")
+                        raise
+        return self._config        
     
     def validate_config(self, config: Optional[GPPMConfig] = None) -> Dict[str, bool]:
         """設定の検証。
@@ -582,7 +564,7 @@ class ConfigManager:
         # 追加の検証
         try:
             # 期間の妥当性
-            if config.data.end_period < config.data.start_period:
+            if config.analysis_period.end < config.analysis_period.start:
                 validation_results['period_validity'] = False
             else:
                 validation_results['period_validity'] = True
