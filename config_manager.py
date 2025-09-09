@@ -327,20 +327,6 @@ class GPPMConfig(BaseSettings):
             raise ValueError(f'log_level must be one of {valid_levels}')
         return v.upper()
     
-    @field_validator('log_file', mode='before')
-    @classmethod
-    def convert_log_file_to_path(cls, v) -> Optional[Path]:
-        """ログファイルパスをPathオブジェクトに変換。
-
-        Args:
-            v: 変換対象の値（文字列またはPathオブジェクト）
-
-        Returns:
-            変換後のPathオブジェクト（Noneの場合はNone）
-        """
-        return Path(v) if isinstance(v, str) and v else v
-    
-    
     @classmethod
     def settings_customise_sources(
         cls,
