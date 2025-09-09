@@ -65,23 +65,17 @@ class ProcessingConfig:
         """ConfigManagerから設定を読み込んでProcessingConfigを作成"""
         config = config_manager.get_config()
         
-        # データ処理設定を取得
-        data_processing_config = config.data_processing
-        
-        # 変分推論設定を取得
-        variational_config = config.variational_inference
-        
         return cls(
             chunk_size=1000,  # デフォルト値
-            max_workers=data_processing_config.parallel_workers,
-            memory_limit_mb=data_processing_config.memory_limit_mb,
-            dtype=data_processing_config.data_type,
+            max_workers=config.processing.max_workers,
+            memory_limit_mb=1024,  # デフォルト値
+            dtype='object',  # デフォルト値
             engine='c',  # デフォルト値
             comment_char='#',  # デフォルト値
             skip_blank_lines=True,  # デフォルト値
-            bayesian_result_path=variational_config.existing_result_path,
-            bayesian_output_dir=config.output.directory,
-            config_file_path=config_manager.config_file_path
+            bayesian_result_path=None,  # デフォルト値
+            bayesian_output_dir=config.output.base_directory,
+            config_file_path=None  # デフォルト値
         )
 
 
@@ -126,13 +120,12 @@ class CSVProcessor:
         """
         try:
             config = self.config_manager.get_config()
-            variational_config = config.variational_inference
             
             return BayesianConfig(
-                result_path=variational_config.existing_result_path,
-                output_dir=config.output.directory,
-                model=variational_config.inference_config.__dict__,
-                variational=variational_config.inference_config.__dict__
+                result_path=None,  # デフォルト値
+                output_dir=config.output.base_directory,
+                model={},  # デフォルト値
+                variational={}  # デフォルト値
             )
                 
         except Exception as e:
@@ -418,9 +411,9 @@ class CSVProcessor:
             
             # 設定ファイルから統合結果の出力パスを取得
             config = self.config_manager.get_config()
-            output_dir = Path(config.output.directory)
+            output_dir = Path(config.output.base_directory)
             output_dir.mkdir(parents=True, exist_ok=True)
-            integrated_path = output_dir / config.output.files.integrated
+            integrated_path = output_dir / "integrated_analysis_result.pkl"
             
             integrated_result.to_pickle(integrated_path)
             results['integrated'] = integrated_result
@@ -439,12 +432,12 @@ def main():
     processor = CSVProcessor(config_manager=config_manager)
     
     # 設定ファイルから出力パスを取得
-    output_dir = Path(config.output.directory)
+    output_dir = Path(config.output.base_directory)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # ファイルパス（例 - 実際の使用時は設定ファイルまたはコマンドライン引数で指定）
     csv_path = '/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202505/item_roic_rbics/result/Item_ROIC_Item_Beta-20250627033115.csv'
-    out_path = output_dir / config.output.files.csv_processed
+    out_path = output_dir / "csv_processed_result.pkl"
     
     try:
         # 統合処理の実行
