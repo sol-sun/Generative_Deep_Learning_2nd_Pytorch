@@ -6,12 +6,12 @@ usage() {
 Usage: scripts/install_cmdstan.sh [options]
 
 CmdStanの最新または指定バージョンをダウンロード・展開・（任意で）ビルドします。
-既定では「cmdstan-<version>」というバージョン付きディレクトリに展開し、その中でビルドします。
+既定では「$HOME/.cmdstan/cmdstan-<version>」に配置し、そのディレクトリ内でビルドします。
 
 Options:
   --version VERSION         特定のバージョンを指定 (例: 2.37.0)
   --install-dir DIR         インストール（配置）先ディレクトリ
-                            （default: cmdstan-<version>）
+                            （default: $HOME/.cmdstan/cmdstan-<version>）
   --no-build                ダウンロード・展開のみ実行（ビルドはスキップ）
   --log FILE                ログファイルパス (default: logs/cmdstan_install.log)
   -h, --help                このヘルプを表示
@@ -76,7 +76,7 @@ check_requirements() {
 # GitHub APIから最新バージョンを取得
 get_latest_version() {
   local api_response
-  if ! api_response=$(curl -k -fsSL  "https://api.github.com/repos/stan-dev/cmdstan/releases/latest"); then
+  if ! api_response=$(curl -fsSL --retry 3 --retry-delay 2 "https://api.github.com/repos/stan-dev/cmdstan/releases/latest"); then
     log "ERROR: GitHub APIへのアクセスに失敗しました" >&2
     exit 1
   fi
@@ -115,7 +115,7 @@ download_cmdstan() {
   local filename="$2"
 
   log "ダウンロード中: ${url}"
-  if ! curl -k-fSLo "$filename" "$url"; then
+  if ! curl -fSLo "$filename" --retry 3 --retry-delay 2 "$url"; then
     log "ERROR: ダウンロードに失敗しました"
     exit 1
   fi
@@ -188,10 +188,10 @@ main() {
   # バージョン情報の取得・表示
   show_version_info
 
-  # 既定の展開先/インストール先は「cmdstan-<version>」
+  # 既定の展開先/インストール先は「~/.cmdstan/cmdstan-<version>」
   local extract_dir="cmdstan-${VERSION}"
   if [[ -z "$INSTALL_DIR" ]]; then
-    INSTALL_DIR="$extract_dir"
+    INSTALL_DIR="${HOME}/.cmdstan/${extract_dir}"
   fi
 
   # 既存のINSTALL_DIRがある場合は削除
@@ -205,7 +205,7 @@ main() {
   # ダウンロード
   download_cmdstan "$url" "$filename"
 
-  # 展開
+  # 展開（作業ディレクトリに展開し、その後 INSTALL_DIR へ移動）
   extract_archive "$filename" "$extract_dir"
 
   # ビルド（オプション）
