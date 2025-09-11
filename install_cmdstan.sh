@@ -27,7 +27,6 @@ VERSION=""
 INSTALL_DIR=""
 NO_BUILD="false"
 LOG=""
-START_DIR="$(pwd)"
 
 # ログファイルパスの決定とディレクトリ作成
 if [[ -z "${LOG}" ]]; then
@@ -91,93 +90,6 @@ get_latest_version() {
   echo "${tag_name#v}"
 }
 
-# バージョン情報の表示
-show_version_info() {
-  if [[ -n "$VERSION" ]]; then
-    log "指定されたバージョン: ${VERSION}"
-  else
-    VERSION=$(get_latest_version)
-    log "最新バージョン: ${VERSION}"
-  fi
-}
-
-# ダウンロードURLの構築
-build_download_url() {
-  local version="$1"
-  local base_url="https://github.com/stan-dev/cmdstan/releases/download"
-  local filename="cmdstan-${version}.tar.gz"
-  echo "${base_url}/v${version}/${filename}"
-}
-
-# ファイルのダウンロード
-download_cmdstan() {
-  local url="$1"
-  local filename="$2"
-
-  log "ダウンロード中: ${url}"
-  if ! curl -fSLo "$filename" --retry 3 --retry-delay 2 "$url"; then
-    log "ERROR: ダウンロードに失敗しました"
-    exit 1
-  fi
-  log "ダウンロード完了: ${filename}"
-}
-
-# アーカイブの展開（テンポラリに展開してから移動）
-extract_archive() {
-  local filename="$1"
-  local extract_dir="$2"
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  log "展開中: ${filename}"
-  if ! tar -xzf "$filename" -C "$tmpdir"; then
-    log "ERROR: アーカイブの展開に失敗しました"
-    exit 1
-  fi
-  mv "$tmpdir/$extract_dir" .
-  rmdir "$tmpdir"
-  log "展開完了: ${extract_dir}"
-}
-
-# CmdStanのビルド
-build_cmdstan() {
-  local cmdstan_dir="$1"
-
-  log "CmdStanをビルド中..."
-  pushd "$cmdstan_dir" >/dev/null
-  if ! make build; then
-    log "ERROR: ビルドに失敗しました"
-    popd >/dev/null
-    exit 1
-  fi
-
-  # 成功確認：stanc のバージョンを記録（存在すれば）
-  if [[ -x "bin/stanc" ]]; then
-    ./bin/stanc --version 2>&1 | tee -a "$LOG" || true
-  fi
-
-  popd >/dev/null
-  log "ビルド完了"
-}
-
-# インストール先の準備（既存があれば削除）
-prepare_install_dir() {
-  local install_dir="$1"
-  if [[ -n "$install_dir" && -d "$install_dir" ]]; then
-    log "既存のインストールを削除中: ${install_dir}"
-    rm -rf "$install_dir"
-  fi
-}
-
-# 絶対パス表示用に整形
-abs_path_of_install_dir() {
-  local p="$1"
-  if [[ "$p" = /* ]]; then
-    echo "$p"
-  else
-    echo "${START_DIR}/$p"
-  fi
-}
-
 # メイン処理
 main() {
   log "== CmdStan インストール開始 =="
@@ -186,50 +98,81 @@ main() {
   check_requirements
 
   # バージョン情報の取得・表示
-  show_version_info
+  if [[ -n "$VERSION" ]]; then
+    log "指定されたバージョン: ${VERSION}"
+  else
+    VERSION=$(get_latest_version)
+    log "最新バージョン: ${VERSION}"
+  fi
 
-  # 既定の展開先/インストール先は「~/.cmdstan/cmdstan-<version>」
+  # インストール先の決定
   local extract_dir="cmdstan-${VERSION}"
   if [[ -z "$INSTALL_DIR" ]]; then
     INSTALL_DIR="${HOME}/.cmdstan/${extract_dir}"
   fi
 
-  # 既存のINSTALL_DIRがある場合は削除
-  prepare_install_dir "$INSTALL_DIR"
-
   # ダウンロードURLとファイル名
-  local url
-  url=$(build_download_url "$VERSION")
+  local url="https://github.com/stan-dev/cmdstan/releases/download/v${VERSION}/cmdstan-${VERSION}.tar.gz"
   local filename="cmdstan-${VERSION}.tar.gz"
+  local download_dir
+  download_dir="$(mktemp -d)"
 
   # ダウンロード
-  download_cmdstan "$url" "$filename"
+  log "ダウンロード中: ${url}"
+  if ! curl -k -fSL --max-time 300 --retry 3 --retry-delay 5 -o "${download_dir}/${filename}" "$url"; then
+    log "ERROR: ダウンロードに失敗しました（3回リトライ後）"
+    exit 1
+  fi
+  log "ダウンロード完了: ${download_dir}/${filename}"
 
-  # 展開（作業ディレクトリに展開し、その後 INSTALL_DIR へ移動）
-  extract_archive "$filename" "$extract_dir"
+  # 展開（直接インストール先に展開）
+  log "展開中: ${download_dir}/${filename}"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  if ! tar -xzf "${download_dir}/${filename}" -C "$tmpdir"; then
+    log "ERROR: アーカイブの展開に失敗しました"
+    exit 1
+  fi
+
+  # インストール先の準備
+  mkdir -p "$(dirname "$INSTALL_DIR")"
+  if [[ -d "$INSTALL_DIR" ]]; then
+    log "既存のインストール先を削除中: ${INSTALL_DIR}"
+    rm -rf "$INSTALL_DIR"
+  fi
+
+  # インストール先に移動
+  mv "$tmpdir/$extract_dir" "$INSTALL_DIR"
+  rmdir "$tmpdir"
+  log "展開完了: ${INSTALL_DIR}"
 
   # ビルド（オプション）
   if [[ "$NO_BUILD" != "true" ]]; then
-    build_cmdstan "$extract_dir"
+    log "CmdStanをビルド中..."
+    pushd "$INSTALL_DIR" >/dev/null
+    if ! make build; then
+      log "ERROR: ビルドに失敗しました"
+      popd >/dev/null
+      exit 1
+    fi
+
+    # 成功確認：stanc のバージョンを記録（存在すれば）
+    if [[ -x "bin/stanc" ]]; then
+      ./bin/stanc --version 2>&1 | tee -a "$LOG" || true
+    fi
+
+    popd >/dev/null
+    log "ビルド完了"
   else
     log "ビルドをスキップしました"
   fi
 
-  # インストール先への移動・命名（必要な場合のみ）
-  if [[ "$INSTALL_DIR" != "$extract_dir" ]]; then
-    mkdir -p "$(dirname "$INSTALL_DIR")"
-    log "インストール先に移動中: ${INSTALL_DIR}"
-    mv "$extract_dir" "$INSTALL_DIR"
-  fi
-
   # クリーンアップ
   log "一時ファイルを削除中..."
-  rm -f "$filename"
+  rm -rf "$download_dir"
 
   log "== インストール完了 =="
-  local abs_install
-  abs_install="$(abs_path_of_install_dir "$INSTALL_DIR")"
-  log "インストール先: ${abs_install}"
+  log "インストール先: ${INSTALL_DIR}"
 
   if [[ "$NO_BUILD" != "true" ]]; then
     log "CmdStanが正常にインストールされました。"
