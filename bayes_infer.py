@@ -31,12 +31,13 @@ import json
 from pathlib import Path
 import pickle
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
+
+import cmdstanpy
+from cmdstanpy import CmdStanModel
 
 from gppm.core.config_manager import ConfigManager, get_logger
-from gppm.analysis.bayesian.inference import BayesianInference
-from gppm.analysis.bayesian.model_builder import BayesianModelBuilder
-from cmdstanpy import CmdStanModel
+from gppm.analysis.bayesian.bayesian_engine import BayesianEngine
 
 
 def _load_processed(path: Path) -> Dict[str, Any]:
@@ -78,11 +79,70 @@ def _ensure_outdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_model_path(option_model_path: Path | None, config_model_path: str) -> Path:
+    """
+    モデルパスの解決（優先順位: オプション > 設定ファイル）
+    
+    Args:
+        option_model_path: コマンドラインオプションで指定されたモデルパス
+        config_model_path: 設定ファイルで指定されたモデルパス（必須）
+        
+    Returns:
+        解決されたモデルパス
+        
+    Raises:
+        FileNotFoundError: モデルファイルが見つからない場合
+        ValueError: モデルファイルの拡張子が不正な場合
+    """
+    logger = get_logger(__name__)
+    
+    # 1. オプションで指定されたモデルパス（最優先）
+    if option_model_path:
+        if not option_model_path.exists():
+            raise FileNotFoundError(f"オプションで指定されたStanモデルファイルが見つかりません: {option_model_path}")
+        if option_model_path.suffix != '.stan':
+            raise ValueError(f"Stanモデルファイルの拡張子は.stanである必要があります: {option_model_path}")
+        logger.info(f"オプションで指定されたStanモデルファイルを使用: {option_model_path}")
+        return option_model_path
+    
+    # 2. 設定ファイルで指定されたモデルパス（必須）
+    config_path = Path(config_model_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"設定ファイルで指定されたStanモデルファイルが見つかりません: {config_path}")
+    if config_path.suffix != '.stan':
+        raise ValueError(f"設定ファイルで指定されたStanモデルファイルの拡張子が不正です: {config_path}")
+    
+    logger.info(f"設定ファイルで指定されたStanモデルファイルを使用: {config_path}")
+    return config_path
+
+
+def _save_inference_results(fit_result, outdir: Path) -> Tuple[Path, Path | None]:
+    """推論結果の保存"""
+    logger = get_logger(__name__)
+    result_subdir = outdir / "result"
+    result_subdir.mkdir(parents=True, exist_ok=True)
+    
+    # 結果の保存
+    result_path = result_subdir / "variational_inference_result.pkl"
+    with result_path.open("wb") as f:
+        pickle.dump(fit_result, f)
+    
+    # サマリの生成
+    try:
+        summary_stats = fit_result.variational_sample.describe()
+        summary_path = result_subdir / "inference_summary.csv"
+        summary_stats.to_csv(summary_path)
+        return result_path, summary_path
+    except Exception as e:
+        logger.warning(f"サマリ生成に失敗しました: {e}")
+        return result_path, None
+
+
 def run_variational_inference(
     *,
     processed: Dict[str, Any],
     engine: str,
-    model_path: Path | None,
+    model_path: Path,
     draws: int,
     variational_iter: int,
     seed: int,
@@ -97,89 +157,55 @@ def run_variational_inference(
     _ensure_outdir(outdir)
     summary = _summarize(processed)
 
-    # ベイジアン推論エンジンの初期化
-    inference_engine = BayesianInference(output_dir=str(outdir))
+    # 統合ベイジアンエンジンの初期化
+    bayesian_engine = BayesianEngine(output_dir=str(outdir))
     
-    # モデルビルダーの初期化
-    model_builder = BayesianModelBuilder()
+    # Stanモデルのコンパイル
+    model = bayesian_engine.compile_model(model_path)
     
-    try:
-        # Stanモデルの準備
-        if model_path and model_path.exists():
-            logger.info(f"指定されたStanモデルファイルを使用: {model_path}")
-            model = CmdStanModel(stan_file=str(model_path))
-        else:
-            logger.info("デフォルトの階層ベイジアンROICモデルを使用")
-            # デフォルトモデルのStanコードを取得してコンパイル
-            stan_code = model_builder.get_hierarchical_roic_model_code()
-            model_file = model_builder.model_dir / "hierarchical_roic_model.stan"
-            with model_file.open("w", encoding="utf-8") as f:
-                f.write(stan_code)
-            model = CmdStanModel(stan_file=str(model_file))
-        
-        # Stanデータの準備
-        stan_data = processed["stan_data"]
-        logger.info(f"Stanデータの形状: {len(stan_data)} 個の変数")
-        
-        # 変分推論の実行
-        logger.info(f"変分推論開始 - サンプル数: {draws}, 最適化反復数: {variational_iter}")
-        fit_result = inference_engine.run_variational_inference(
-            model=model,
-            data=stan_data,
-            draws=draws,
-            iter=variational_iter,
-            seed=seed,
-            show_console=True,
-            require_converged=False
-        )
-        
-        # 結果の保存
-        result_path = outdir / "variational_inference_result.pkl"
-        with result_path.open("wb") as f:
-            pickle.dump(fit_result, f)
-        
-        # サマリの生成
-        summary_stats = fit_result.summary()
-        summary_path = outdir / "inference_summary.csv"
-        summary_stats.to_csv(summary_path)
-        
-        meta = {
-            "status": "completed",
-            "message": "変分推論が正常に完了しました。",
-            "engine": engine,
-            "model_path": str(model_path) if model_path else "default_hierarchical_roic",
-            "variational_draws": draws,
-            "variational_iter": variational_iter,
-            "seed": seed,
-            "data_summary": summary,
-            "result_files": {
-                "fit_result": str(result_path),
-                "summary": str(summary_path)
-            },
-            "convergence_info": {
-                "elbo": float(fit_result.variational_sample['lp__'].mean()) if 'lp__' in fit_result.variational_sample else None,
-                "converged": True  # 変分推論は通常収束する
-            }
+    # Stanデータの準備
+    stan_data = processed["stan_data"]
+    logger.info(f"Stanデータの形状: {len(stan_data)} 個の変数")
+    
+    # 変分推論の実行
+    fit_result = bayesian_engine.run_variational_inference(
+        model=model,
+        data=stan_data,
+        draws=draws,
+        iter=variational_iter,
+        seed=seed,
+        show_console=True,
+        require_converged=False
+    )
+    
+    # 結果の保存
+    result_path, summary_path = _save_inference_results(fit_result, outdir)
+    
+    # メタ情報の作成
+    meta = {
+        "status": "completed",
+        "message": "変分推論が正常に完了しました。",
+        "engine": engine,
+        "model_path": str(model_path) if model_path else "default_hierarchical_roic",
+        "variational_draws": draws,
+        "variational_iter": variational_iter,
+        "seed": seed,
+        "data_summary": summary,
+        "result_files": {
+            "fit_result": str(result_path),
+            "summary": str(summary_path) if summary_path else None
+        },
+        "convergence_info": {
+            "elbo": float(fit_result.variational_sample['lp__'].mean()) if 'lp__' in fit_result.variational_sample else None,
+            "converged": True  # 変分推論は通常収束する
         }
-        
-        logger.info("変分推論完了")
-        
-    except Exception as e:
-        logger.error(f"変分推論実行中にエラーが発生: {e}")
-        meta = {
-            "status": "error",
-            "message": f"変分推論実行中にエラーが発生しました: {str(e)}",
-            "engine": engine,
-            "model_path": str(model_path) if model_path else None,
-            "variational_draws": draws,
-            "variational_iter": variational_iter,
-            "seed": seed,
-            "data_summary": summary,
-        }
-        raise
+    }
+    
+    logger.info("変分推論完了")
 
     # 出力にメタ情報を保存
-    meta_path = outdir / "inference_meta.json"
+    result_subdir = outdir / "result"
+    meta_path = result_subdir / "inference_meta.json"
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return meta
@@ -200,43 +226,51 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     variational_config = config.variational_inference
     inference_config = variational_config.inference_config
     
-    # デフォルト値の設定
+    # デフォルト値の設定（設定ファイル優先）
     default_engine = inference_config.engine
     default_draws = inference_config.samples
     default_iter = inference_config.optimization_iterations
     default_seed = inference_config.random_seed
     default_output = config.output.directory
+    default_data = config.output.directory / config.output.files.dataset
+    
+    # 設定ファイルからモデルファイルパスを取得（必須）
+    config_model_file = inference_config.model_file
+    if config_model_file is None:
+        raise ValueError("設定ファイルでmodel_fileが指定されていません。gppm_config.ymlでmodel_fileを設定してください。")
+    default_model = Path(config_model_file)
     
     p = argparse.ArgumentParser(
         prog="gppm.bayes_infer",
-        description="Global PPM: 変分推論実行CLI",
+        description="Global PPM: 変分推論実行CLI（設定ファイル優先、オプションで上書き）",
     )
     p.add_argument(
         "--data",
         type=Path,
-        required=False,
-        help="前処理済みデータファイル（pickle）のパス（未指定時は設定ファイルから自動取得）",
+        default=default_data,
+        help="前処理済みデータファイル（pickle）のパス（設定ファイルの値を上書き）",
     )
     p.add_argument(
         "--engine",
         type=str,
         default=default_engine,
         choices=["cmdstanpy", "pymc"],
-        help="変分推論エンジンの種類",
+        help="変分推論エンジンの種類（設定ファイルの値を上書き）",
     )
     p.add_argument(
         "--model",
         type=Path,
-        help="Stanモデルファイル（.stan）のパス",
+        default=default_model,
+        help="Stanモデルファイル（.stan）のパス（設定ファイルの値を上書き）",
     )
-    p.add_argument("--draws", type=int, default=default_draws, help="変分推論で生成するサンプル数")
-    p.add_argument("--iter", dest="variational_iter", type=int, default=default_iter, help="変分推論の最適化反復数")
-    p.add_argument("--seed", type=int, default=default_seed, help="乱数シード（再現性のため）")
+    p.add_argument("--draws", type=int, default=default_draws, help="変分推論で生成するサンプル数（設定ファイルの値を上書き）")
+    p.add_argument("--iter", dest="variational_iter", type=int, default=default_iter, help="変分推論の最適化反復数（設定ファイルの値を上書き）")
+    p.add_argument("--seed", type=int, default=default_seed, help="乱数シード（設定ファイルの値を上書き）")
     p.add_argument(
         "--output",
         type=Path,
         default=default_output,
-        help="変分推論結果の出力ディレクトリ",
+        help="変分推論結果の出力ディレクトリ（設定ファイルの値を上書き）",
     )
     return p.parse_args(argv)
 
@@ -245,47 +279,53 @@ def main(argv: list[str] | None = None) -> Dict[str, Any]:
     # ロガーの初期化
     logger = get_logger(__name__)
     
-    try:
-        ns = parse_args(argv or sys.argv[1:])
-        
-        # 設定を取得
-        config_manager = ConfigManager()
-        config = config_manager.get_config()
-        
-        # 入力データパスの解決: 明示指定 > 設定の推定 > エラー
-        data_path = ns.data
-        if data_path is None:
-            # 設定ファイルからデータパスを推定
-            data_path = config.output.directory / config.output.files.dataset
-            logger.info(f"データパスを設定から推定: {data_path}")
+    logger.info("=== Global PPM 変分推論CLI 開始 ===")
+    
+    ns = parse_args(argv or sys.argv[1:])
+    
+    # 設定を取得
+    config_manager = ConfigManager()
+    config = config_manager.get_config()
+    
+    # 設定適用状況のログ出力
+    logger.info("=== 設定適用状況 ===")
+    logger.info(f"データファイル: {ns.data}")
+    logger.info(f"推論エンジン: {ns.engine}")
+    logger.info(f"Stanモデル: {ns.model if ns.model else 'デフォルト'}")
+    logger.info(f"サンプル数: {ns.draws}")
+    logger.info(f"最適化反復数: {ns.variational_iter}")
+    logger.info(f"乱数シード: {ns.seed}")
+    logger.info(f"出力ディレクトリ: {ns.output}")
+    logger.info(f"設定ファイル: {config_manager.config_file}")
+    
+    # データパスの解決（設定ファイル優先、オプションで上書き）
+    data_path = ns.data
 
-        logger.info(f"データファイル読み込み開始: {data_path}")
-        processed = _load_processed(data_path)
-        logger.info("データファイル読み込み完了")
+    logger.info(f"データファイル読み込み開始: {data_path}")
+    processed = _load_processed(data_path)
+    logger.info("データファイル読み込み完了")
 
-        # モデルパスの確認
-        if ns.model is None:
-            logger.info("--model 未指定: デフォルトの階層ベイジアンROICモデルを使用します。")
+    # モデルパスの解決（優先順位: オプション > 設定ファイル）
+    variational_config = config.variational_inference
+    inference_config = variational_config.inference_config
+    model_path = _resolve_model_path(ns.model, inference_config.model_file)
 
-        logger.info(f"変分推論開始 - エンジン: {ns.engine}, サンプル数: {ns.draws}, 最適化反復数: {ns.variational_iter}")
-        meta = run_variational_inference(
-            processed=processed,
-            engine=ns.engine,
-            model_path=ns.model,
-            draws=ns.draws,
-            variational_iter=ns.variational_iter,
-            seed=ns.seed,
-            outdir=ns.output,
-        )
-        logger.info("変分推論処理完了")
+    logger.info("=== 変分推論実行開始 ===")
+    logger.info(f"エンジン: {ns.engine}, サンプル数: {ns.draws}, 最適化反復数: {ns.variational_iter}")
+    meta = run_variational_inference(
+        processed=processed,
+        engine=ns.engine,
+        model_path=model_path,
+        draws=ns.draws,
+        variational_iter=ns.variational_iter,
+        seed=ns.seed,
+        outdir=ns.output,
+    )
+    logger.info("=== 変分推論処理完了 ===")
 
-        # コンソールにサマリを出力
-        print(json.dumps(meta, ensure_ascii=False, indent=2))
-        return meta
-        
-    except Exception as e:
-        logger.error(f"エラーが発生しました: {e}")
-        raise
+    # コンソールにサマリを出力
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+    return meta
 
 
 if __name__ == "__main__":
