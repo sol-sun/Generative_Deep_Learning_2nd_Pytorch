@@ -1,29 +1,28 @@
 """
-CSV処理と変分推論結果統合ツール
-巨大なCSVファイルを効率的に処理し、変分推論結果と統合するツール
+CSV処理ツール
+巨大なCSVファイルを効率的に処理するツール
 
 主な機能:
 - 巨大なCSVファイルの効率的な処理
-- 変分推論結果の読み込みと統合
 - 設定ファイルからの設定読み込み
 - 並列処理による高速化
 - エラーハンドリングとログ機能
 
 使用方法:
-1. 設定ファイル (gppm_config.yml) で変分推論結果のパスと出力設定を設定
+1. 設定ファイル (gppm_config.yml) で出力設定を設定
 2. CSVProcessor を初期化（ConfigManagerを使用）
-3. process_csv_with_variational_integration() で統合処理を実行
+3. process_csv_to_pkl() でCSV処理を実行
 
 例:
-    from gppm.cli.csv_to_pkl_optimized import CSVProcessor
+    from gppm.cli.csv_to_pkl import CSVProcessor
     from gppm.core.config_manager import ConfigManager
     
     # ConfigManagerを使用して設定を読み込み
     config_manager = ConfigManager()
     processor = CSVProcessor(config_manager=config_manager)
     
-    # 統合処理の実行（出力パスは設定ファイルから自動取得）
-    results = processor.process_csv_with_variational_integration(
+    # CSV処理の実行（出力パスは設定ファイルから自動取得）
+    result = processor.process_csv_to_pkl(
         csv_path="input.csv",
         out_path="output.pkl"  # 設定ファイルの出力設定を使用する場合は任意
     )
@@ -34,13 +33,10 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, Dict, Any
-import logging
 import sys
 from dataclasses import dataclass
 import time
 from tqdm import tqdm
-import yaml
-import pickle
 import argparse
 
 from gppm.core.config_manager import ConfigManager, get_logger
@@ -56,9 +52,7 @@ class ProcessingConfig:
     engine: str = 'c'
     comment_char: str = '#'
     skip_blank_lines: bool = True
-    # ベイズ関連設定
-    bayesian_result_path: Optional[str] = None
-    bayesian_output_dir: Optional[str] = None
+    # 設定ファイルパス
     config_file_path: Optional[str] = None
     
     @classmethod
@@ -74,19 +68,8 @@ class ProcessingConfig:
             engine='c',  # デフォルト値
             comment_char='#',  # デフォルト値
             skip_blank_lines=True,  # デフォルト値
-            bayesian_result_path=None,  # デフォルト値
-            bayesian_output_dir=config.output.directory,
             config_file_path=None  # デフォルト値
         )
-
-
-@dataclass
-class BayesianConfig:
-    """変分推論設定を管理するデータクラス"""
-    result_path: str
-    output_dir: str
-    model: Dict[str, Any]
-    variational: Dict[str, Any]
 
 
 class CSVProcessor:
@@ -110,66 +93,8 @@ class CSVProcessor:
             self.config_manager = config_manager or ConfigManager()
         
         self.logger = get_logger(__name__)
-        self.bayesian_config = self._load_bayesian_config()
     
-    def _load_bayesian_config(self) -> Optional[BayesianConfig]:
-        """
-        ConfigManagerから変分推論設定を読み込み
-        
-        Returns:
-            変分推論設定オブジェクト。設定が存在しない場合はNone
-        """
-        try:
-            config = self.config_manager.get_config()
-            
-            return BayesianConfig(
-                result_path=config.variational_inference.existing_result_path,
-                output_dir=config.output.directory,
-                model={},  # デフォルト値
-                variational={}  # デフォルト値
-            )
-                
-        except Exception as e:
-            self.logger.error(f"変分推論設定の読み込みに失敗: {e}")
-        
-        return None
     
-    def load_bayesian_result(self, result_path: Optional[str] = None) -> Optional[pd.Series]:
-        """
-        変分推論結果を読み込み
-        
-        Args:
-            result_path: 変分推論結果ファイルのパス。Noneの場合は設定から取得
-            
-        Returns:
-            変分推論結果のSeries。読み込みに失敗した場合はNone
-        """
-        if result_path is None:
-            if self.bayesian_config is None:
-                self.logger.error("変分推論設定が読み込まれていません")
-                return None
-            result_path = self.bayesian_config.result_path
-        
-        try:
-            result_path = Path(result_path)
-            if not result_path.exists():
-                self.logger.error(f"変分推論結果ファイルが見つかりません: {result_path}")
-                return None
-            
-            self.logger.info(f"変分推論結果を読み込み中: {result_path}")
-            with open(result_path, 'rb') as f:
-                result = pickle.load(f)
-            
-            if isinstance(result, pd.Series):
-                self.logger.info(f"変分推論結果読み込み完了: {len(result)} 要素")
-                return result
-            else:
-                self.logger.error(f"変分推論結果の形式が不正です: {type(result)}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"変分推論結果の読み込みに失敗: {e}")
-            return None
     
     def _validate_inputs(self, csv_path: Union[str, Path], out_path: Union[str, Path]) -> None:
         """
@@ -372,61 +297,12 @@ class CSVProcessor:
         
         return final_result
     
-    def process_csv_with_variational_integration(
-        self,
-        csv_path: Union[str, Path],
-        out_path: Union[str, Path],
-        variational_result_path: Optional[str] = None,
-        num_chunks: Optional[int] = None,
-        show_progress: bool = True
-    ) -> Dict[str, pd.Series]:
-        """
-        CSV処理と変分推論結果の統合処理
-        
-        Args:
-            csv_path: 入力CSVファイルのパス
-            out_path: 出力PKLファイルのパス
-            variational_result_path: 変分推論結果ファイルのパス
-            num_chunks: 処理チャンク数
-            show_progress: 進捗表示の有無
-            
-        Returns:
-            統合結果の辞書
-        """
-        results = {}
-        
-        # 変分推論結果の読み込み
-        variational_result = self.load_bayesian_result(variational_result_path)
-        if variational_result is not None:
-            results['variational'] = variational_result
-            self.logger.info("変分推論結果を統合処理に含めます")
-        
-        # CSV処理実行
-        csv_result = self.process_csv_to_pkl(csv_path, out_path, num_chunks, show_progress)
-        results['csv_processed'] = csv_result
-        
-        # 統合結果の保存
-        if variational_result is not None and not csv_result.empty:
-            # 変分推論結果とCSV結果を統合
-            integrated_result = pd.concat([variational_result, csv_result], axis=0)
-            
-            # 設定ファイルから統合結果の出力パスを取得
-            config = self.config_manager.get_config()
-            output_dir = Path(config.output.directory)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            integrated_path = output_dir / config.output.files.integrated
-            
-            integrated_result.to_pickle(integrated_path)
-            results['integrated'] = integrated_result
-            self.logger.info(f"統合結果を保存: {integrated_path}")
-        
-        return results
 
 
 def parse_arguments():
     """コマンドライン引数を解析"""
     parser = argparse.ArgumentParser(
-        description="CSV処理と変分推論結果統合ツール",
+        description="CSV処理ツール",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
@@ -453,11 +329,6 @@ def parse_arguments():
         help='出力PKLファイルのパス（設定ファイルの出力設定を使用する場合は省略可能）'
     )
     
-    parser.add_argument(
-        '--variational-result', '-v',
-        type=str,
-        help='変分推論結果ファイルのパス（設定ファイルで指定されていない場合に使用）'
-    )
     
     parser.add_argument(
         '--chunks', '-c',
@@ -502,28 +373,20 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / config.output.files.csv_processed
     
-    # 変分推論結果パスの決定（優先順位: コマンドライン引数 > 設定ファイル）
-    variational_result_path = args.variational_result or config.variational_inference.existing_result_path
     
     try:
-        # 統合処理の実行
-        results = processor.process_csv_with_variational_integration(
+        # CSV処理の実行
+        result = processor.process_csv_to_pkl(
             csv_path=csv_path,
             out_path=out_path,
-            variational_result_path=variational_result_path,
             num_chunks=args.chunks,
             show_progress=not args.no_progress
         )
         
         # 結果の表示
         print("\n=== 処理結果 ===")
-        for key, result in results.items():
-            if isinstance(result, pd.Series):
-                print(f"{key}: {len(result)} 要素")
-            else:
-                print(f"{key}: {result}")
-        
-        print(f"\n出力ファイル: {out_path}")
+        print(f"CSV処理結果: {len(result)} 要素")
+        print(f"出力ファイル: {out_path}")
         
     except Exception as e:
         print(f"エラーが発生しました: {e}")
