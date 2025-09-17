@@ -599,7 +599,7 @@ class DataFrameBuilder:
             data: {entity_name: {time_key: value}} の形式
             
         Returns:
-            時系列DataFrame
+            時系列DataFrame (index=企業名/セグメント名, columns=時点)
         """
         if not data:
             return pd.DataFrame()
@@ -612,12 +612,12 @@ class DataFrameBuilder:
         # 時点でソート
         sorted_times = sorted(all_times, key=lambda x: int(x[1:]) if x.startswith('t') else 0)
         
-        # DataFrameを構築
+        # DataFrameを構築（entity_nameをindex、time_keyをcolumnsに）
         df_data = {}
-        for time_key in sorted_times:
-            df_data[time_key] = {}
-            for entity_name, entity_data in data.items():
-                df_data[time_key][entity_name] = entity_data.get(time_key, np.nan)
+        for entity_name, entity_data in data.items():
+            df_data[entity_name] = {}
+            for time_key in sorted_times:
+                df_data[entity_name][time_key] = entity_data.get(time_key, np.nan)
         
         return pd.DataFrame(df_data).T  # 転置してentity_nameをindexに
     
@@ -629,7 +629,7 @@ class DataFrameBuilder:
             data: {'median': {entity_name: value}, 'std': {entity_name: value}} の形式
             
         Returns:
-            観測誤差DataFrame
+            観測誤差DataFrame (index=企業名/セグメント名, columns=['median', 'std'])
         """
         if not data['median']:
             return pd.DataFrame()
@@ -641,7 +641,7 @@ class DataFrameBuilder:
                 'std': data['std'].get(entity_name, np.nan)
             }
         
-        return pd.DataFrame(df_data).T
+        return pd.DataFrame(df_data).T  # 転置してentity_nameをindexに
 
 
 class CSVFileValidator:
