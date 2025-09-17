@@ -277,8 +277,16 @@ class ColumnNameGenerator:
         """時点IDから月次文字列を取得"""
         if not self.time_mapping:
             # 時点マッピングが空の場合は、t{time_id}形式を返す
+            logging.warning(f"時点マッピングが空です。time_id={time_id}をt{time_id}として返します。")
             return f"t{time_id}"
-        return self.time_mapping.get(time_id, f"t{time_id}")
+        
+        # Stanパラメータの時点IDは1ベース、時点マッピングは0ベースなので調整
+        adjusted_time_id = time_id - 1
+        
+        result = self.time_mapping.get(adjusted_time_id, f"t{time_id}")
+        if result == f"t{time_id}":
+            logging.warning(f"時点マッピングにtime_id={time_id}(adjusted={adjusted_time_id})が見つかりません。利用可能なキー: {list(self.time_mapping.keys())}")
+        return result
     
     def parse_stan_parameter(self, column_name: str) -> Dict[str, Any]:
         """
