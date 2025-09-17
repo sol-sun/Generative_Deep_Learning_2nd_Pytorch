@@ -1,21 +1,14 @@
 """
-CSV処理ツール
+CSV処理ツール（改善版）
 CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ名から意味のあるカラム名で出力するツール
 
-主な機能:
-- CmdStanPyの出力CSVファイルの効率的な処理
-- Stanパラメータ名の自動解析と意味のあるカラム名生成
-- 設定ファイルからの設定読み込み
-- 並列処理による高速化
-- エラーハンドリングとログ機能
-- L5/L6プロダクトレベル設定対応
-
-カラム名生成（Stanパラメータ名から）:
-- 製品ROIC: median_product_[ID]_roic_t[時間], std_product_[ID]_roic_t[時間]
-- セグメントプライベート効果: median_segment_[ID]_private_effect_t[時間], std_segment_[ID]_private_effect_t[時間]
-- 連結プライベート効果: median_consol_[ID]_private_effect_t[時間], std_consol_[ID]_private_effect_t[時間]
-- 観測誤差: median_segment_[ID]_observation_error, std_consol_[ID]_observation_error
-- その他: median_log_posterior, median_consol_student_t_df など
+主な改善点:
+- 関数の分割と責任の明確化
+- エラーハンドリングの強化
+- メモリ効率の最適化
+- テスト可能性の向上
+- 設定検証の強化
+- 型安全性の向上
 
 使用方法:
 1. 設定ファイル (gppm_config.yml) で出力設定を設定
@@ -23,7 +16,7 @@ CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ�
 3. process_csv_to_pkl() でCSV処理を実行
 
 例:
-    from gppm.cli.csv_to_pkl import CSVProcessor
+    from gppm.cli.csv_to_pkl_improved import CSVProcessor
     from gppm.core.config_manager import ConfigManager
     
     # ConfigManagerを使用して設定を読み込み
@@ -41,16 +34,39 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import List, Optional, Tuple, Union, Dict, Any, Protocol
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from tqdm import tqdm
 import argparse
 import pickle
+import logging
+from contextlib import contextmanager
+import gc
 
 from gppm.core.config_manager import ConfigManager, get_logger
 import re
+
+
+class DataLoader(Protocol):
+    """データ読み込みのインターフェース"""
+    def load_dataset(self, file_path: str) -> Dict[str, Any]:
+        """データセットファイルを読み込む"""
+        ...
+
+
+class PickleDataLoader:
+    """Pickleファイル用のデータローダー"""
+    
+    def load_dataset(self, file_path: str) -> Dict[str, Any]:
+        """Pickleファイルからデータセットを読み込む"""
+        try:
+            with open(file_path, 'rb') as f:
+                return pickle.load(f)
+        except (FileNotFoundError, pickle.PickleError, EOFError) as e:
+            logging.warning(f"データセットファイルの読み込みに失敗: {file_path}, エラー: {e}")
+            return {}
 
 
 @dataclass
@@ -63,12 +79,22 @@ class ProcessingConfig:
     engine: str = 'c'
     comment_char: str = '#'
     skip_blank_lines: bool = True
-    # 設定ファイルパス
     config_file_path: Optional[str] = None
-    # カラム名生成設定
     product_level: str = 'L6'
-    # データセットファイルパス（製品名・エンティティ名マッピング用）
     dataset_file: Optional[str] = None
+    
+    def __post_init__(self):
+        """設定値の検証"""
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_sizeは1以上である必要があります")
+        if self.max_workers <= 0:
+            raise ValueError("max_workersは1以上である必要があります")
+        if self.memory_limit_mb <= 0:
+            raise ValueError("memory_limit_mbは1以上である必要があります")
+        if self.dtype not in ['float32', 'float64']:
+            raise ValueError("dtypeは'float32'または'float64'である必要があります")
+        if self.product_level not in ['L5', 'L6']:
+            raise ValueError("product_levelは'L5'または'L6'である必要があります")
     
     @classmethod
     def from_config_manager(cls, config_manager: ConfigManager) -> 'ProcessingConfig':
@@ -76,47 +102,53 @@ class ProcessingConfig:
         config = config_manager.get_config()
         
         return cls(
-            chunk_size=1000,  # デフォルト値
+            chunk_size=1000,
             max_workers=config.data_processing.parallel_workers,
             memory_limit_mb=config.data_processing.memory_limit_mb,
             dtype=config.data_processing.data_type,
-            engine='c',  # デフォルト値
-            comment_char='#',  # デフォルト値
-            skip_blank_lines=True,  # デフォルト値
-            config_file_path=None,  # デフォルト値
+            engine='c',
+            comment_char='#',
+            skip_blank_lines=True,
+            config_file_path=None,
             product_level=config.product_level.level,
             dataset_file=str(config.output.directory / config.output.files.dataset)
         )
 
 
 class ColumnNameGenerator:
-    """カラム名生成クラス"""
+    """カラム名生成クラス（改善版）"""
     
-    def __init__(self, product_level: str = 'L6', dataset_file: Optional[str] = None):
+    def __init__(
+        self, 
+        product_level: str = 'L6', 
+        dataset_file: Optional[str] = None,
+        data_loader: Optional[DataLoader] = None
+    ):
         """
         初期化
         
         Args:
             product_level: 製品レベル（L6, L5）
             dataset_file: データセットファイルパス（名前マッピング用）
+            data_loader: データローダー（テスト用に注入可能）
         """
         self.product_level = product_level
         self.dataset_file = dataset_file
+        self.data_loader = data_loader or PickleDataLoader()
         
         # 名前マッピング情報を読み込み
-        self.product_names = []
-        self.entity_info = {}
-        self.segment_info = {}
+        self.product_names: List[str] = []
+        self.entity_info: Dict[int, str] = {}
+        self.segment_info: Dict[int, str] = {}
         self._load_name_mappings()
     
-    def _load_name_mappings(self):
+    def _load_name_mappings(self) -> None:
         """データセットファイルから名前マッピング情報を読み込み"""
         if not self.dataset_file or not Path(self.dataset_file).exists():
             return
         
         try:
-            with open(self.dataset_file, 'rb') as f:
-                dataset = pickle.load(f)
+            dataset = self.data_loader.load_dataset(self.dataset_file)
             
             # 製品名の読み込み
             if 'product_names' in dataset:
@@ -131,7 +163,7 @@ class ColumnNameGenerator:
                         entity_df['FACTSET_ENTITY_ID'].tolist()
                     ))
             
-            # セグメント情報の読み込み（pivot_tablesから）
+            # セグメント情報の読み込み
             if 'pivot_tables' in dataset:
                 pivot_tables = dataset['pivot_tables']
                 if 'Y_segment' in pivot_tables:
@@ -143,8 +175,7 @@ class ColumnNameGenerator:
                         ))
             
         except Exception as e:
-            # エラーが発生した場合は空のマッピングで続行
-            pass
+            logging.warning(f"名前マッピングの読み込みに失敗: {e}")
     
     def parse_stan_parameter(self, column_name: str) -> Dict[str, Any]:
         """
@@ -180,68 +211,45 @@ class ColumnNameGenerator:
             param_name = column_name
             indices = []
         
-        # パラメータ名が空の場合は解析失敗
         if not param_name:
             return result
         
         # パラメータタイプの判定
-        if param_name == 'Item_ROIC':
-            result['parameter_type'] = 'product_roic'
-            result['is_product'] = True
-            if len(indices) >= 2:
+        parameter_mappings = {
+            'Item_ROIC': ('product_roic', True, False, False),
+            'segment_private': ('segment_private_effect', False, True, False),
+            'consol_private': ('consol_private_effect', False, False, True),
+            's_t': ('product_roic_std', True, False, False),
+            'seg_sigma': ('segment_observation_error', False, True, False),
+            'consol_sigma': ('consol_observation_error', False, False, True),
+            's_segment_private': ('segment_private_std', False, True, False),
+            's_consol_private': ('consol_private_std', False, False, True),
+        }
+        
+        if param_name in parameter_mappings:
+            param_type, is_product, is_segment, is_consolidated = parameter_mappings[param_name]
+            result['parameter_type'] = param_type
+            result['is_product'] = is_product
+            result['is_segment'] = is_segment
+            result['is_consolidated'] = is_consolidated
+            
+            # インデックスの処理
+            if param_name == 'Item_ROIC' and len(indices) >= 2:
                 result['product_id'] = int(indices[0])
                 result['time_id'] = int(indices[1])
-        
-        elif param_name == 'segment_private':
-            result['parameter_type'] = 'segment_private_effect'
-            result['is_segment'] = True
-            if len(indices) >= 2:
-                result['entity_id'] = f"SEG_{indices[0]}"
+            elif param_name in ['segment_private', 'consol_private'] and len(indices) >= 2:
+                result['entity_id'] = f"{'SEG' if is_segment else 'CONSOL'}_{indices[0]}"
                 result['time_id'] = int(indices[1])
-        
-        elif param_name == 'consol_private':
-            result['parameter_type'] = 'consol_private_effect'
-            result['is_consolidated'] = True
-            if len(indices) >= 2:
-                result['entity_id'] = f"CONSOL_{indices[0]}"
-                result['time_id'] = int(indices[1])
-        
-        elif param_name == 's_t':
-            result['parameter_type'] = 'product_roic_std'
-            result['is_product'] = True
-            if len(indices) >= 1:
-                result['product_id'] = int(indices[0])
-        
-        elif param_name == 'seg_sigma':
-            result['parameter_type'] = 'segment_observation_error'
-            result['is_segment'] = True
-            if len(indices) >= 1:
-                result['entity_id'] = f"SEG_{indices[0]}"
-        
-        elif param_name == 'consol_sigma':
-            result['parameter_type'] = 'consol_observation_error'
-            result['is_consolidated'] = True
-            if len(indices) >= 1:
-                result['entity_id'] = f"CONSOL_{indices[0]}"
-        
-        elif param_name == 's_segment_private':
-            result['parameter_type'] = 'segment_private_std'
-            result['is_segment'] = True
-            if len(indices) >= 1:
-                result['entity_id'] = f"SEG_{indices[0]}"
-        
-        elif param_name == 's_consol_private':
-            result['parameter_type'] = 'consol_private_std'
-            result['is_consolidated'] = True
-            if len(indices) >= 1:
-                result['entity_id'] = f"CONSOL_{indices[0]}"
+            elif param_name in ['s_t', 'seg_sigma', 'consol_sigma', 's_segment_private', 's_consol_private'] and len(indices) >= 1:
+                if param_name == 's_t':
+                    result['product_id'] = int(indices[0])
+                else:
+                    result['entity_id'] = f"{'SEG' if is_segment else 'CONSOL'}_{indices[0]}"
         
         elif param_name in ['nu_consol_roic', 'nu_seg_roic']:
             result['parameter_type'] = 'student_t_df'
-            if 'consol' in param_name:
-                result['is_consolidated'] = True
-            else:
-                result['is_segment'] = True
+            result['is_consolidated'] = 'consol' in param_name
+            result['is_segment'] = 'seg' in param_name
         
         return result
     
@@ -257,82 +265,93 @@ class ColumnNameGenerator:
         Returns:
             生成されたカラム名
         """
-        # Stanパラメータ名を解析
         parsed = self.parse_stan_parameter(original_name)
         
         if parsed['parameter_type'] is None:
-            # 解析できない場合は元の列名を使用
             return f"{stat_type}_{original_name}"
         
         # パラメータタイプに応じてカラム名を生成
-        if parsed['parameter_type'] == 'log_posterior':
-            return f"{stat_type}_log_posterior"
+        name_generators = {
+            'log_posterior': lambda: f"{stat_type}_log_posterior",
+            'product_roic': lambda: self._generate_product_roic_name(parsed, stat_type),
+            'product_roic_std': lambda: self._generate_product_roic_std_name(parsed, stat_type),
+            'segment_private_effect': lambda: self._generate_segment_private_name(parsed, stat_type),
+            'consol_private_effect': lambda: self._generate_consol_private_name(parsed, stat_type),
+            'segment_observation_error': lambda: self._generate_segment_error_name(parsed, stat_type),
+            'consol_observation_error': lambda: self._generate_consol_error_name(parsed, stat_type),
+            'segment_private_std': lambda: self._generate_segment_std_name(parsed, stat_type),
+            'consol_private_std': lambda: self._generate_consol_std_name(parsed, stat_type),
+            'student_t_df': lambda: self._generate_student_t_name(parsed, stat_type),
+        }
         
-        elif parsed['parameter_type'] == 'product_roic':
-            product_id = parsed.get('product_id', 'unknown')
-            time_id = parsed.get('time_id', 'unknown')
-            # 実際の製品名を使用
-            product_name = self._get_product_name(product_id)
-            return f"{stat_type}_product_{product_name}_roic_t{time_id}"
+        generator = name_generators.get(parsed['parameter_type'])
+        if generator:
+            return generator()
         
-        elif parsed['parameter_type'] == 'product_roic_std':
-            product_id = parsed.get('product_id', 'unknown')
-            # 実際の製品名を使用
-            product_name = self._get_product_name(product_id)
-            return f"{stat_type}_product_{product_name}_roic_std"
-        
-        elif parsed['parameter_type'] == 'segment_private_effect':
-            entity_id = parsed.get('entity_id', 'unknown')
-            time_id = parsed.get('time_id', 'unknown')
-            # 実際のセグメント名を使用
-            segment_name = self._get_segment_name(entity_id)
-            return f"{stat_type}_segment_{segment_name}_private_effect_t{time_id}"
-        
-        elif parsed['parameter_type'] == 'consol_private_effect':
-            entity_id = parsed.get('entity_id', 'unknown')
-            time_id = parsed.get('time_id', 'unknown')
-            # 実際の企業名を使用
-            company_name = self._get_company_name(entity_id)
-            return f"{stat_type}_consol_{company_name}_private_effect_t{time_id}"
-        
-        elif parsed['parameter_type'] == 'segment_observation_error':
-            entity_id = parsed.get('entity_id', 'unknown')
-            # 実際のセグメント名を使用
-            segment_name = self._get_segment_name(entity_id)
-            return f"{stat_type}_segment_{segment_name}_observation_error"
-        
-        elif parsed['parameter_type'] == 'consol_observation_error':
-            entity_id = parsed.get('entity_id', 'unknown')
-            # 実際の企業名を使用
-            company_name = self._get_company_name(entity_id)
-            return f"{stat_type}_consol_{company_name}_observation_error"
-        
-        elif parsed['parameter_type'] == 'segment_private_std':
-            entity_id = parsed.get('entity_id', 'unknown')
-            # 実際のセグメント名を使用
-            segment_name = self._get_segment_name(entity_id)
-            return f"{stat_type}_segment_{segment_name}_private_std"
-        
-        elif parsed['parameter_type'] == 'consol_private_std':
-            entity_id = parsed.get('entity_id', 'unknown')
-            # 実際の企業名を使用
-            company_name = self._get_company_name(entity_id)
-            return f"{stat_type}_consol_{company_name}_private_std"
-        
-        elif parsed['parameter_type'] == 'student_t_df':
-            if parsed['is_consolidated']:
-                return f"{stat_type}_consol_student_t_df"
-            else:
-                return f"{stat_type}_segment_student_t_df"
-        
+        return f"{stat_type}_{index}"
+    
+    def _generate_product_roic_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """製品ROIC名を生成"""
+        product_id = parsed.get('product_id', 'unknown')
+        time_id = parsed.get('time_id', 'unknown')
+        product_name = self._get_product_name(product_id)
+        return f"{stat_type}_roic_{product_name}_t{time_id}"
+    
+    def _generate_product_roic_std_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """製品ROIC標準偏差名を生成"""
+        product_id = parsed.get('product_id', 'unknown')
+        product_name = self._get_product_name(product_id)
+        return f"{stat_type}_roic_{product_name}_std"
+    
+    def _generate_segment_private_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """セグメントプライベート効果名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        time_id = parsed.get('time_id', 'unknown')
+        segment_name = self._get_segment_name(entity_id)
+        return f"{stat_type}_segment_{segment_name}_private_effect_t{time_id}"
+    
+    def _generate_consol_private_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """連結プライベート効果名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        time_id = parsed.get('time_id', 'unknown')
+        company_name = self._get_company_name(entity_id)
+        return f"{stat_type}_consol_{company_name}_private_effect_t{time_id}"
+    
+    def _generate_segment_error_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """セグメント観測誤差名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        segment_name = self._get_segment_name(entity_id)
+        return f"{stat_type}_segment_{segment_name}_observation_error"
+    
+    def _generate_consol_error_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """連結観測誤差名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        company_name = self._get_company_name(entity_id)
+        return f"{stat_type}_consol_{company_name}_observation_error"
+    
+    def _generate_segment_std_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """セグメントプライベート標準偏差名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        segment_name = self._get_segment_name(entity_id)
+        return f"{stat_type}_segment_{segment_name}_private_std"
+    
+    def _generate_consol_std_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """連結プライベート標準偏差名を生成"""
+        entity_id = parsed.get('entity_id', 'unknown')
+        company_name = self._get_company_name(entity_id)
+        return f"{stat_type}_consol_{company_name}_private_std"
+    
+    def _generate_student_t_name(self, parsed: Dict[str, Any], stat_type: str) -> str:
+        """Student's t分布自由度名を生成"""
+        if parsed['is_consolidated']:
+            return f"{stat_type}_consol_student_t_df"
         else:
-            # その他の場合は従来の形式
-            return f"{stat_type}_{index}"
+            return f"{stat_type}_segment_student_t_df"
     
     def _get_product_name(self, product_id: Any) -> str:
         """製品IDから製品名を取得"""
         try:
-            product_id = int(product_id) - 1  # Stanのインデックスは1ベース、Pythonは0ベース
+            product_id = int(product_id) - 1  # Stanのインデックスは1ベース
             if 0 <= product_id < len(self.product_names):
                 return self.product_names[product_id]
         except (ValueError, IndexError):
@@ -342,9 +361,8 @@ class ColumnNameGenerator:
     def _get_company_name(self, entity_id: Any) -> str:
         """エンティティIDから企業名を取得"""
         try:
-            # entity_idは "CONSOL_X" 形式なので、Xの部分を抽出
             if isinstance(entity_id, str) and entity_id.startswith("CONSOL_"):
-                consol_id = int(entity_id.replace("CONSOL_", "")) - 1  # Stanのインデックスは1ベース
+                consol_id = int(entity_id.replace("CONSOL_", "")) - 1
                 if 0 <= consol_id < len(self.entity_info):
                     return self.entity_info[consol_id]
         except (ValueError, IndexError):
@@ -354,9 +372,8 @@ class ColumnNameGenerator:
     def _get_segment_name(self, entity_id: Any) -> str:
         """エンティティIDからセグメント名を取得"""
         try:
-            # entity_idは "SEG_X" 形式なので、Xの部分を抽出
             if isinstance(entity_id, str) and entity_id.startswith("SEG_"):
-                segment_id = int(entity_id.replace("SEG_", "")) - 1  # Stanのインデックスは1ベース
+                segment_id = int(entity_id.replace("SEG_", "")) - 1
                 if 0 <= segment_id < len(self.segment_info):
                     return self.segment_info[segment_id]
         except (ValueError, IndexError):
@@ -364,16 +381,52 @@ class ColumnNameGenerator:
         return f"segment_{entity_id}"
 
 
-class CSVProcessor:
-    """CSV処理と変分推論結果統合を管理するクラス"""
+class CSVFileValidator:
+    """CSVファイルの検証クラス"""
     
-    def __init__(self, config: Optional[ProcessingConfig] = None, config_manager: Optional[ConfigManager] = None):
+    @staticmethod
+    def validate_file_path(file_path: Union[str, Path]) -> Path:
+        """ファイルパスの検証"""
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"ファイルが見つかりません: {path}")
+        
+        if not path.suffix.lower() == '.csv':
+            raise ValueError(f"CSVファイルではありません: {path}")
+        
+        if not path.is_file():
+            raise ValueError(f"ファイルではありません: {path}")
+        
+        return path
+    
+    @staticmethod
+    def validate_output_path(output_path: Union[str, Path]) -> Path:
+        """出力パスの検証とディレクトリ作成"""
+        path = Path(output_path)
+        
+        # 出力ディレクトリを作成
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        return path
+
+
+class CSVProcessor:
+    """CSV処理と変分推論結果統合を管理するクラス（改善版）"""
+    
+    def __init__(
+        self, 
+        config: Optional[ProcessingConfig] = None, 
+        config_manager: Optional[ConfigManager] = None,
+        data_loader: Optional[DataLoader] = None
+    ):
         """
         初期化
         
         Args:
             config: 処理設定。Noneの場合はConfigManagerから読み込み
             config_manager: 設定管理オブジェクト。Noneの場合は新規作成
+            data_loader: データローダー（テスト用に注入可能）
         """
         if config is None:
             if config_manager is None:
@@ -385,40 +438,14 @@ class CSVProcessor:
             self.config_manager = config_manager or ConfigManager()
         
         self.logger = get_logger(__name__)
+        self.data_loader = data_loader or PickleDataLoader()
         
         # カラム名生成器を初期化
         self.column_name_generator = ColumnNameGenerator(
             product_level=self.config.product_level,
-            dataset_file=self.config.dataset_file
+            dataset_file=self.config.dataset_file,
+            data_loader=self.data_loader
         )
-    
-    
-    def _validate_inputs(self, csv_path: Union[str, Path], out_path: Union[str, Path]) -> None:
-        """
-        入力パラメータの検証
-        
-        Args:
-            csv_path: 入力CSVファイルのパス
-            out_path: 出力PKLファイルのパス
-            
-        Raises:
-            FileNotFoundError: CSVファイルが存在しない場合
-            ValueError: パスが無効な場合
-        """
-        csv_path = Path(csv_path)
-        out_path = Path(out_path)
-        
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSVファイルが見つかりません: {csv_path}")
-        
-        if not csv_path.suffix.lower() == '.csv':
-            raise ValueError(f"CSVファイルではありません: {csv_path}")
-        
-        # 出力ディレクトリを作成
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        self.logger.info(f"入力ファイル: {csv_path}")
-        self.logger.info(f"出力ファイル: {out_path}")
     
     def _get_column_info(self, csv_path: Path) -> Tuple[List[str], int]:
         """
@@ -443,8 +470,11 @@ class CSVProcessor:
             columns = sample_df.columns.tolist()
             
             # 行数を取得（効率的に）
-            with open(csv_path, 'r') as f:
-                total_rows = sum(1 for line in f if not line.strip().startswith(self.config.comment_char))
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                total_rows = sum(
+                    1 for line in f 
+                    if not line.strip().startswith(self.config.comment_char)
+                )
             
             self.logger.info(f"列数: {len(columns)}, 推定行数: {total_rows}")
             return columns, total_rows
@@ -468,7 +498,8 @@ class CSVProcessor:
         # カラム名生成器をローカルで作成
         column_name_generator = ColumnNameGenerator(
             product_level=product_level,
-            dataset_file=dataset_file
+            dataset_file=dataset_file,
+            data_loader=self.data_loader
         )
         
         try:
@@ -485,16 +516,15 @@ class CSVProcessor:
             if chunk_df.empty:
                 return pd.Series(dtype=config.dtype)
             
-            # 統計値を計算（列ごと、つまりStanパラメータごと）
-            median_series = chunk_df.median(axis=0)  # 列方向の中央値
-            std_series = chunk_df.std(axis=0)        # 列方向の標準偏差
+            # 統計値を計算
+            median_series = chunk_df.median(axis=0)
+            std_series = chunk_df.std(axis=0)
             
-            # 新しいカラム名を生成（Stanパラメータ名から）
+            # 新しいカラム名を生成
             median_names = []
             std_names = []
             
             for col_name in chunk_df.columns:
-                # Stanパラメータ名から意味のあるカラム名を生成
                 median_name = column_name_generator.generate_column_name(col_name, "median", 0)
                 std_name = column_name_generator.generate_column_name(col_name, "std", 0)
                 
@@ -528,6 +558,24 @@ class CSVProcessor:
         chunk_size = max(1, len(columns) // num_chunks)
         return [columns[i:i + chunk_size] for i in range(0, len(columns), chunk_size)]
     
+    @contextmanager
+    def _memory_monitor(self):
+        """メモリ使用量の監視"""
+        import psutil
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        try:
+            yield
+        finally:
+            final_memory = process.memory_info().rss / 1024 / 1024  # MB
+            memory_used = final_memory - initial_memory
+            self.logger.info(f"メモリ使用量: {memory_used:.2f} MB")
+            
+            if memory_used > self.config.memory_limit_mb:
+                self.logger.warning(f"メモリ制限を超過: {memory_used:.2f} MB > {self.config.memory_limit_mb} MB")
+                gc.collect()
+    
     def process_csv_to_pkl(
         self, 
         csv_path: Union[str, Path], 
@@ -550,58 +598,63 @@ class CSVProcessor:
         start_time = time.time()
         
         # 入力検証
-        self._validate_inputs(csv_path, out_path)
+        csv_path = CSVFileValidator.validate_file_path(csv_path)
+        out_path = CSVFileValidator.validate_output_path(out_path)
         
-        # 列情報取得
-        columns, total_rows = self._get_column_info(Path(csv_path))
+        self.logger.info(f"入力ファイル: {csv_path}")
+        self.logger.info(f"出力ファイル: {out_path}")
         
-        # チャンク数決定
-        if num_chunks is None:
-            num_chunks = min(self.config.max_workers * 2, len(columns))
-        
-        # 列を分割
-        column_chunks = self._split_columns(columns, num_chunks)
-        self.logger.info(f"処理チャンク数: {len(column_chunks)}")
-        
-        # 並列処理
-        results = []
-        with ProcessPoolExecutor(max_workers=self.config.max_workers) as executor:
-            # タスクを投入
-            future_to_chunk = {
-                executor.submit(
-                    self._process_chunk, 
-                    (chunk, Path(csv_path), self.config, self.config.product_level, self.config.dataset_file)
-                ): i for i, chunk in enumerate(column_chunks)
-            }
+        with self._memory_monitor():
+            # 列情報取得
+            columns, total_rows = self._get_column_info(csv_path)
             
-            # 進捗表示付きで結果を収集
-            if show_progress:
-                futures = tqdm(
-                    as_completed(future_to_chunk), 
-                    total=len(future_to_chunk),
-                    desc="CSV処理中"
-                )
+            # チャンク数決定
+            if num_chunks is None:
+                num_chunks = min(self.config.max_workers * 2, len(columns))
+            
+            # 列を分割
+            column_chunks = self._split_columns(columns, num_chunks)
+            self.logger.info(f"処理チャンク数: {len(column_chunks)}")
+            
+            # 並列処理
+            results = []
+            with ProcessPoolExecutor(max_workers=self.config.max_workers) as executor:
+                # タスクを投入
+                future_to_chunk = {
+                    executor.submit(
+                        self._process_chunk, 
+                        (chunk, csv_path, self.config, self.config.product_level, self.config.dataset_file)
+                    ): i for i, chunk in enumerate(column_chunks)
+                }
+                
+                # 進捗表示付きで結果を収集
+                if show_progress:
+                    futures = tqdm(
+                        as_completed(future_to_chunk), 
+                        total=len(future_to_chunk),
+                        desc="CSV処理中"
+                    )
+                else:
+                    futures = as_completed(future_to_chunk)
+                
+                for future in futures:
+                    try:
+                        result = future.result()
+                        if not result.empty:
+                            results.append(result)
+                    except Exception as e:
+                        chunk_idx = future_to_chunk[future]
+                        self.logger.error(f"チャンク {chunk_idx} の処理に失敗: {e}")
+            
+            # 結果を結合
+            if not results:
+                self.logger.warning("処理結果が空です")
+                final_result = pd.Series(dtype=self.config.dtype)
             else:
-                futures = as_completed(future_to_chunk)
+                final_result = pd.concat(results, axis=0)
             
-            for future in futures:
-                try:
-                    result = future.result()
-                    if not result.empty:
-                        results.append(result)
-                except Exception as e:
-                    chunk_idx = future_to_chunk[future]
-                    self.logger.error(f"チャンク {chunk_idx} の処理に失敗: {e}")
-        
-        # 結果を結合
-        if not results:
-            self.logger.warning("処理結果が空です")
-            final_result = pd.Series(dtype=self.config.dtype)
-        else:
-            final_result = pd.concat(results, axis=0)
-        
-        # PKLファイルに保存
-        final_result.to_pickle(out_path)
+            # PKLファイルに保存
+            final_result.to_pickle(out_path)
         
         # 処理時間と結果情報をログ出力
         processing_time = time.time() - start_time
@@ -615,31 +668,30 @@ class CSVProcessor:
         
         # 生成されたカラム名の例を表示
         if len(final_result) > 0:
-            sample_names = list(final_result.index[:5])  # 最初の5個のカラム名
+            sample_names = list(final_result.index[:5])
             self.logger.info(f"生成されたカラム名の例: {sample_names}")
         
         return final_result
-    
 
 
 def parse_arguments():
     """コマンドライン引数を解析"""
     parser = argparse.ArgumentParser(
-        description="CSV処理ツール",
+        description="CSV処理ツール（改善版）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
   # 設定ファイルのCSVファイルパスを使用
-  python csv_to_pkl.py
+  python csv_to_pkl_improved.py
   
   # コマンドライン引数でCSVファイルパスを指定
-  python csv_to_pkl.py --csv-file /path/to/input.csv
+  python csv_to_pkl_improved.py --csv-file /path/to/input.csv
   
   # 出力パスも指定
-  python csv_to_pkl.py --csv-file /path/to/input.csv --output /path/to/output.pkl
+  python csv_to_pkl_improved.py --csv-file /path/to/input.csv --output /path/to/output.pkl
   
   # L5プロダクトレベルで処理
-  python csv_to_pkl.py --csv-file /path/to/input.csv --product-level L5
+  python csv_to_pkl_improved.py --csv-file /path/to/input.csv --product-level L5
         """
     )
     
@@ -655,7 +707,6 @@ def parse_arguments():
         help='出力PKLファイルのパス（設定ファイルの出力設定を使用する場合は省略可能）'
     )
     
-    
     parser.add_argument(
         '--chunks', '-c',
         type=int,
@@ -667,7 +718,6 @@ def parse_arguments():
         action='store_true',
         help='進捗表示を無効にする'
     )
-    
     
     parser.add_argument(
         '--product-level',
@@ -687,7 +737,7 @@ def main():
     config_manager = ConfigManager()
     config = config_manager.get_config()
     
-    # プロセッサー初期化（ConfigManagerから設定を自動読み込み）
+    # プロセッサー初期化
     processor = CSVProcessor(config_manager=config_manager)
     
     # コマンドライン引数で設定を上書き
@@ -695,7 +745,7 @@ def main():
         processor.config.product_level = args.product_level
         processor.column_name_generator.product_level = args.product_level
     
-    # CSVファイルパスの決定（優先順位: コマンドライン引数 > 設定ファイル）
+    # CSVファイルパスの決定
     csv_path = args.csv_file or config.csv_processing.input_file
     if csv_path is None:
         print("エラー: CSVファイルパスが指定されていません。")
@@ -703,14 +753,13 @@ def main():
         print("コマンドライン引数 --csv-file でパスを指定してください。")
         sys.exit(1)
     
-    # 出力パスの決定（優先順位: コマンドライン引数 > 設定ファイル）
+    # 出力パスの決定
     if args.output:
         out_path = Path(args.output)
     else:
         output_dir = Path(config.output.directory)
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / config.output.files.csv_processed
-    
     
     try:
         # CSV処理の実行
@@ -730,7 +779,7 @@ def main():
         
         # 生成されたカラム名の例を表示
         if len(result) > 0:
-            sample_names = list(result.index[:3])  # 最初の3個のカラム名
+            sample_names = list(result.index[:3])
             print(f"生成されたカラム名の例: {sample_names}")
         
     except Exception as e:
