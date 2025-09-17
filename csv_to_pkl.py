@@ -1,18 +1,21 @@
 """
 CSV処理ツール
-巨大なCSVファイルを効率的に処理し、企業IDとセグメント名を含むカラム名で出力するツール
+CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ名から意味のあるカラム名で出力するツール
 
 主な機能:
-- 巨大なCSVファイルの効率的な処理
+- CmdStanPyの出力CSVファイルの効率的な処理
+- Stanパラメータ名の自動解析と意味のあるカラム名生成
 - 設定ファイルからの設定読み込み
 - 並列処理による高速化
 - エラーハンドリングとログ機能
-- 企業IDとセグメント名を含むカラム名生成（デフォルト）
 - L5/L6プロダクトレベル設定対応
 
-カラム名生成:
-- 連結系: median_[FACTSET_ENTITY_ID], std_[FACTSET_ENTITY_ID]
-- セグメント系: median_[FACTSET_ENTITY_ID]_[セグメント名], std_[FACTSET_ENTITY_ID]_[セグメント名]
+カラム名生成（Stanパラメータ名から）:
+- 製品ROIC: median_product_[ID]_roic_t[時間], std_product_[ID]_roic_t[時間]
+- セグメントプライベート効果: median_segment_[ID]_private_effect_t[時間], std_segment_[ID]_private_effect_t[時間]
+- 連結プライベート効果: median_consol_[ID]_private_effect_t[時間], std_consol_[ID]_private_effect_t[時間]
+- 観測誤差: median_segment_[ID]_observation_error, std_consol_[ID]_observation_error
+- その他: median_log_posterior, median_consol_student_t_df など
 
 使用方法:
 1. 設定ファイル (gppm_config.yml) で出力設定を設定
@@ -27,10 +30,10 @@ CSV処理ツール
     config_manager = ConfigManager()
     processor = CSVProcessor(config_manager=config_manager)
     
-    # CSV処理の実行（出力パスは設定ファイルから自動取得）
+    # CmdStanPyの出力CSVファイルを処理
     result = processor.process_csv_to_pkl(
-        csv_path="input.csv",
-        out_path="output.pkl"  # 設定ファイルの出力設定を使用する場合は任意
+        csv_path="global_ppm_roic_model-20250910175117.csv",
+        out_path="output.pkl"
     )
 """
 
@@ -94,104 +97,169 @@ class ColumnNameGenerator:
         """
         self.product_level = product_level
     
-    def extract_entity_info(self, column_name: str) -> Tuple[Optional[str], Optional[str]]:
+    def parse_stan_parameter(self, column_name: str) -> Dict[str, Any]:
         """
-        カラム名から企業IDとセグメント名を抽出
+        Stanパラメータ名を解析
         
         Args:
-            column_name: カラム名
+            column_name: Stanパラメータ名（例: Item_ROIC.1.1, segment_private.2.3）
             
         Returns:
-            (企業ID, セグメント名)のタプル
+            解析結果の辞書
         """
-        # FACTSET_ENTITY_ID形式のパターン（連結系）
-        entity_pattern = r'^([A-Z0-9]+)$'
-        entity_match = re.match(entity_pattern, column_name)
-        if entity_match:
-            return entity_match.group(1), None
+        result = {
+            'parameter_type': None,
+            'entity_id': None,
+            'segment_name': None,
+            'product_id': None,
+            'time_id': None,
+            'is_consolidated': False,
+            'is_segment': False,
+            'is_product': False
+        }
         
-        # FACTSET_ENTITY_ID_SEGMENT_NAME形式のパターン（セグメント系）
-        segment_pattern = r'^([A-Z0-9]+)_(.+)$'
-        segment_match = re.match(segment_pattern, column_name)
-        if segment_match:
-            return segment_match.group(1), segment_match.group(2)
+        # lp__（対数事後確率）の処理
+        if column_name == 'lp__':
+            result['parameter_type'] = 'log_posterior'
+            return result
         
-        # 製品名を含むパターン（L5/L6レベル対応）
-        # PRODUCT_L5_NAME や PRODUCT_L6_NAME の形式
-        product_pattern = r'^([A-Z0-9]+)_([A-Z0-9]+)_(.+)$'
-        product_match = re.match(product_pattern, column_name)
-        if product_match:
-            return product_match.group(1), f"{product_match.group(2)}_{product_match.group(3)}"
+        # パラメータ名とインデックスを分離
+        if '.' in column_name:
+            param_name, indices = column_name.split('.', 1)
+            indices = indices.split('.')
+        else:
+            param_name = column_name
+            indices = []
         
-        return None, None
+        # パラメータタイプの判定
+        if param_name == 'Item_ROIC':
+            result['parameter_type'] = 'product_roic'
+            result['is_product'] = True
+            if len(indices) >= 2:
+                result['product_id'] = int(indices[0])
+                result['time_id'] = int(indices[1])
+        
+        elif param_name == 'segment_private':
+            result['parameter_type'] = 'segment_private_effect'
+            result['is_segment'] = True
+            if len(indices) >= 2:
+                result['entity_id'] = f"SEG_{indices[0]}"
+                result['time_id'] = int(indices[1])
+        
+        elif param_name == 'consol_private':
+            result['parameter_type'] = 'consol_private_effect'
+            result['is_consolidated'] = True
+            if len(indices) >= 2:
+                result['entity_id'] = f"CONSOL_{indices[0]}"
+                result['time_id'] = int(indices[1])
+        
+        elif param_name == 's_t':
+            result['parameter_type'] = 'product_roic_std'
+            result['is_product'] = True
+            if len(indices) >= 1:
+                result['product_id'] = int(indices[0])
+        
+        elif param_name == 'seg_sigma':
+            result['parameter_type'] = 'segment_observation_error'
+            result['is_segment'] = True
+            if len(indices) >= 1:
+                result['entity_id'] = f"SEG_{indices[0]}"
+        
+        elif param_name == 'consol_sigma':
+            result['parameter_type'] = 'consol_observation_error'
+            result['is_consolidated'] = True
+            if len(indices) >= 1:
+                result['entity_id'] = f"CONSOL_{indices[0]}"
+        
+        elif param_name == 's_segment_private':
+            result['parameter_type'] = 'segment_private_std'
+            result['is_segment'] = True
+            if len(indices) >= 1:
+                result['entity_id'] = f"SEG_{indices[0]}"
+        
+        elif param_name == 's_consol_private':
+            result['parameter_type'] = 'consol_private_std'
+            result['is_consolidated'] = True
+            if len(indices) >= 1:
+                result['entity_id'] = f"CONSOL_{indices[0]}"
+        
+        elif param_name in ['nu_consol_roic', 'nu_seg_roic']:
+            result['parameter_type'] = 'student_t_df'
+            if 'consol' in param_name:
+                result['is_consolidated'] = True
+            else:
+                result['is_segment'] = True
+        
+        return result
     
     def generate_column_name(self, original_name: str, stat_type: str, index: int) -> str:
         """
         新しいカラム名を生成
         
         Args:
-            original_name: 元のカラム名
+            original_name: 元のカラム名（Stanパラメータ名）
             stat_type: 統計タイプ（median, std）
             index: インデックス
             
         Returns:
             生成されたカラム名
         """
-        entity_id, segment_name = self.extract_entity_info(original_name)
+        # Stanパラメータ名を解析
+        parsed = self.parse_stan_parameter(original_name)
         
-        if entity_id is None:
-            # 企業IDが抽出できない場合は従来の形式
+        if parsed['parameter_type'] is None:
+            # 解析できない場合は従来の形式
             return f"{stat_type}_{index}"
         
-        if segment_name is None:
-            # 連結系の場合
-            return f"{stat_type}_{entity_id}"
+        # パラメータタイプに応じてカラム名を生成
+        if parsed['parameter_type'] == 'log_posterior':
+            return f"{stat_type}_log_posterior"
+        
+        elif parsed['parameter_type'] == 'product_roic':
+            product_id = parsed.get('product_id', 'unknown')
+            time_id = parsed.get('time_id', 'unknown')
+            return f"{stat_type}_product_{product_id}_roic_t{time_id}"
+        
+        elif parsed['parameter_type'] == 'product_roic_std':
+            product_id = parsed.get('product_id', 'unknown')
+            return f"{stat_type}_product_{product_id}_roic_std"
+        
+        elif parsed['parameter_type'] == 'segment_private_effect':
+            entity_id = parsed.get('entity_id', 'unknown')
+            time_id = parsed.get('time_id', 'unknown')
+            return f"{stat_type}_segment_{entity_id}_private_effect_t{time_id}"
+        
+        elif parsed['parameter_type'] == 'consol_private_effect':
+            entity_id = parsed.get('entity_id', 'unknown')
+            time_id = parsed.get('time_id', 'unknown')
+            return f"{stat_type}_consol_{entity_id}_private_effect_t{time_id}"
+        
+        elif parsed['parameter_type'] == 'segment_observation_error':
+            entity_id = parsed.get('entity_id', 'unknown')
+            return f"{stat_type}_segment_{entity_id}_observation_error"
+        
+        elif parsed['parameter_type'] == 'consol_observation_error':
+            entity_id = parsed.get('entity_id', 'unknown')
+            return f"{stat_type}_consol_{entity_id}_observation_error"
+        
+        elif parsed['parameter_type'] == 'segment_private_std':
+            entity_id = parsed.get('entity_id', 'unknown')
+            return f"{stat_type}_segment_{entity_id}_private_std"
+        
+        elif parsed['parameter_type'] == 'consol_private_std':
+            entity_id = parsed.get('entity_id', 'unknown')
+            return f"{stat_type}_consol_{entity_id}_private_std"
+        
+        elif parsed['parameter_type'] == 'student_t_df':
+            if parsed['is_consolidated']:
+                return f"{stat_type}_consol_student_t_df"
+            else:
+                return f"{stat_type}_segment_student_t_df"
+        
         else:
-            # セグメント系の場合
-            # 製品レベルに応じてセグメント名を調整
-            if self.product_level == "L5" and "L6" in segment_name:
-                # L5レベルに集約する場合、L6の詳細を除去
-                segment_name = segment_name.replace("_L6_", "_L5_")
-            elif self.product_level == "L6" and "L5" in segment_name:
-                # L6レベルを使用する場合、L5をL6に変更
-                segment_name = segment_name.replace("_L5_", "_L6_")
-            
-            return f"{stat_type}_{entity_id}_{segment_name}"
+            # その他の場合は従来の形式
+            return f"{stat_type}_{index}"
     
-    def get_product_level_suffix(self) -> str:
-        """
-        製品レベルに応じたサフィックスを取得
-        
-        Returns:
-            製品レベルサフィックス
-        """
-        return f"_{self.product_level}" if self.product_level in ["L5", "L6"] else ""
-    
-    def is_consolidated_data(self, column_name: str) -> bool:
-        """
-        連結データかどうかを判定
-        
-        Args:
-            column_name: カラム名
-            
-        Returns:
-            連結データの場合True
-        """
-        entity_id, segment_name = self.extract_entity_info(column_name)
-        return entity_id is not None and segment_name is None
-    
-    def is_segment_data(self, column_name: str) -> bool:
-        """
-        セグメントデータかどうかを判定
-        
-        Args:
-            column_name: カラム名
-            
-        Returns:
-            セグメントデータの場合True
-        """
-        entity_id, segment_name = self.extract_entity_info(column_name)
-        return entity_id is not None and segment_name is not None
 
 
 class CSVProcessor:
@@ -313,27 +381,18 @@ class CSVProcessor:
             if chunk_df.empty:
                 return pd.Series(dtype=config.dtype)
             
-            # 統計値を計算
-            median_series = chunk_df.median(axis=1)
-            std_series = chunk_df.std(axis=1)
+            # 統計値を計算（列ごと、つまりStanパラメータごと）
+            median_series = chunk_df.median(axis=0)  # 列方向の中央値
+            std_series = chunk_df.std(axis=0)        # 列方向の標準偏差
             
-            # 新しいカラム名を生成
+            # 新しいカラム名を生成（Stanパラメータ名から）
             median_names = []
             std_names = []
             
-            for i, (_, row) in enumerate(chunk_df.iterrows()):
-                # 最初の非nullカラム名を取得（企業ID/セグメント名の推定に使用）
-                first_valid_col = None
-                for col in columns:
-                    if col in chunk_df.columns and not pd.isna(chunk_df.loc[i, col]):
-                        first_valid_col = col
-                        break
-                
-                if first_valid_col is None:
-                    first_valid_col = columns[0] if columns else f"col_{i}"
-                
-                median_name = column_name_generator.generate_column_name(first_valid_col, "median", i)
-                std_name = column_name_generator.generate_column_name(first_valid_col, "std", i)
+            for col_name in chunk_df.columns:
+                # Stanパラメータ名から意味のあるカラム名を生成
+                median_name = column_name_generator.generate_column_name(col_name, "median", 0)
+                std_name = column_name_generator.generate_column_name(col_name, "std", 0)
                 
                 median_names.append(median_name)
                 std_names.append(std_name)
