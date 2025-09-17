@@ -1,14 +1,36 @@
 """
-CSV処理ツール（改善版）
-CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ名から意味のあるカラム名で出力するツール
+CSV処理ツール（DataFrame辞書出力版）
+CmdStanPyの出力CSVファイルを効率的に処理し、StanパラメータタイプごとにDataFrameの辞書として出力するツール
 
-主な改善点:
-- 関数の分割と責任の明確化
-- エラーハンドリングの強化
-- メモリ効率の最適化
-- テスト可能性の向上
-- 設定検証の強化
-- 型安全性の向上
+主な機能:
+- StanパラメータタイプごとのDataFrame構築
+- 時系列データの整理（製品ROIC、プライベート効果など）
+- 統計値（median, std）の分離
+- 分析しやすい構造での出力
+
+出力形式:
+{
+    'Item_ROIC': {
+        'median': DataFrame(index=製品名, columns=時点),
+        'std': DataFrame(index=製品名, columns=時点)
+    },
+    'segment_private_effect': {
+        'median': DataFrame(index=セグメント名, columns=時点),
+        'std': DataFrame(index=セグメント名, columns=時点)
+    },
+    'consol_private_effect': {
+        'median': DataFrame(index=企業名, columns=時点),
+        'std': DataFrame(index=企業名, columns=時点)
+    },
+    'observation_errors': {
+        'segment': DataFrame(index=セグメント名, columns=['median', 'std']),
+        'consol': DataFrame(index=企業名, columns=['median', 'std'])
+    },
+    'other_parameters': {
+        'student_t_df': Series,
+        'log_posterior': Series
+    }
+}
 
 使用方法:
 1. 設定ファイル (gppm_config.yml) で出力設定を設定
@@ -16,7 +38,7 @@ CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ�
 3. process_csv_to_pkl() でCSV処理を実行
 
 例:
-    from gppm.cli.csv_to_pkl_improved import CSVProcessor
+    from gppm.cli.csv_to_pkl import CSVProcessor
     from gppm.core.config_manager import ConfigManager
     
     # ConfigManagerを使用して設定を読み込み
@@ -28,6 +50,10 @@ CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ�
         csv_path="global_ppm_roic_model-20250910175117.csv",
         out_path="output.pkl"
     )
+    
+    # 結果の使用例
+    item_roic_median = result['Item_ROIC']['median']
+    segment_effects = result['segment_private_effect']['median']
 """
 
 import pandas as pd
@@ -381,6 +407,243 @@ class ColumnNameGenerator:
         return f"segment_{entity_id}"
 
 
+class DataFrameBuilder:
+    """DataFrame構築クラス"""
+    
+    def __init__(self, column_name_generator: ColumnNameGenerator):
+        """
+        初期化
+        
+        Args:
+            column_name_generator: カラム名生成器
+        """
+        self.column_name_generator = column_name_generator
+        
+        # データを格納する辞書
+        self.data_storage = {
+            'Item_ROIC': {'median': {}, 'std': {}},
+            'segment_private_effect': {'median': {}, 'std': {}},
+            'consol_private_effect': {'median': {}, 'std': {}},
+            'observation_errors': {
+                'segment': {'median': {}, 'std': {}},
+                'consol': {'median': {}, 'std': {}}
+            },
+            'other_parameters': {
+                'student_t_df': {'median': {}, 'std': {}},
+                'log_posterior': {'median': {}, 'std': {}}
+            }
+        }
+    
+    def add_parameter_data(self, original_name: str, median_value: float, std_value: float) -> None:
+        """
+        パラメータデータを追加
+        
+        Args:
+            original_name: 元のStanパラメータ名
+            median_value: 中央値
+            std_value: 標準偏差
+        """
+        parsed = self.column_name_generator.parse_stan_parameter(original_name)
+        
+        if parsed['parameter_type'] is None:
+            return
+        
+        # パラメータタイプに応じてデータを格納
+        if parsed['parameter_type'] == 'product_roic':
+            self._add_product_roic_data(parsed, median_value, std_value)
+        elif parsed['parameter_type'] == 'segment_private_effect':
+            self._add_segment_private_data(parsed, median_value, std_value)
+        elif parsed['parameter_type'] == 'consol_private_effect':
+            self._add_consol_private_data(parsed, median_value, std_value)
+        elif parsed['parameter_type'] in ['segment_observation_error', 'consol_observation_error']:
+            self._add_observation_error_data(parsed, median_value, std_value)
+        elif parsed['parameter_type'] == 'student_t_df':
+            self._add_student_t_data(parsed, median_value, std_value)
+        elif parsed['parameter_type'] == 'log_posterior':
+            self._add_log_posterior_data(median_value, std_value)
+    
+    def _add_product_roic_data(self, parsed: Dict[str, Any], median_value: float, std_value: float) -> None:
+        """製品ROICデータを追加"""
+        product_id = parsed.get('product_id')
+        time_id = parsed.get('time_id')
+        
+        if product_id is not None and time_id is not None:
+            product_name = self.column_name_generator._get_product_name(product_id)
+            time_key = f"t{time_id}"
+            
+            if product_name not in self.data_storage['Item_ROIC']['median']:
+                self.data_storage['Item_ROIC']['median'][product_name] = {}
+                self.data_storage['Item_ROIC']['std'][product_name] = {}
+            
+            self.data_storage['Item_ROIC']['median'][product_name][time_key] = median_value
+            self.data_storage['Item_ROIC']['std'][product_name][time_key] = std_value
+    
+    def _add_segment_private_data(self, parsed: Dict[str, Any], median_value: float, std_value: float) -> None:
+        """セグメントプライベート効果データを追加"""
+        entity_id = parsed.get('entity_id')
+        time_id = parsed.get('time_id')
+        
+        if entity_id is not None and time_id is not None:
+            segment_name = self.column_name_generator._get_segment_name(entity_id)
+            time_key = f"t{time_id}"
+            
+            if segment_name not in self.data_storage['segment_private_effect']['median']:
+                self.data_storage['segment_private_effect']['median'][segment_name] = {}
+                self.data_storage['segment_private_effect']['std'][segment_name] = {}
+            
+            self.data_storage['segment_private_effect']['median'][segment_name][time_key] = median_value
+            self.data_storage['segment_private_effect']['std'][segment_name][time_key] = std_value
+    
+    def _add_consol_private_data(self, parsed: Dict[str, Any], median_value: float, std_value: float) -> None:
+        """連結プライベート効果データを追加"""
+        entity_id = parsed.get('entity_id')
+        time_id = parsed.get('time_id')
+        
+        if entity_id is not None and time_id is not None:
+            company_name = self.column_name_generator._get_company_name(entity_id)
+            time_key = f"t{time_id}"
+            
+            if company_name not in self.data_storage['consol_private_effect']['median']:
+                self.data_storage['consol_private_effect']['median'][company_name] = {}
+                self.data_storage['consol_private_effect']['std'][company_name] = {}
+            
+            self.data_storage['consol_private_effect']['median'][company_name][time_key] = median_value
+            self.data_storage['consol_private_effect']['std'][company_name][time_key] = std_value
+    
+    def _add_observation_error_data(self, parsed: Dict[str, Any], median_value: float, std_value: float) -> None:
+        """観測誤差データを追加"""
+        entity_id = parsed.get('entity_id')
+        
+        if entity_id is not None:
+            if parsed['parameter_type'] == 'segment_observation_error':
+                segment_name = self.column_name_generator._get_segment_name(entity_id)
+                self.data_storage['observation_errors']['segment']['median'][segment_name] = median_value
+                self.data_storage['observation_errors']['segment']['std'][segment_name] = std_value
+            elif parsed['parameter_type'] == 'consol_observation_error':
+                company_name = self.column_name_generator._get_company_name(entity_id)
+                self.data_storage['observation_errors']['consol']['median'][company_name] = median_value
+                self.data_storage['observation_errors']['consol']['std'][company_name] = std_value
+    
+    def _add_student_t_data(self, parsed: Dict[str, Any], median_value: float, std_value: float) -> None:
+        """Student's t分布自由度データを追加"""
+        key = 'consol' if parsed['is_consolidated'] else 'segment'
+        self.data_storage['other_parameters']['student_t_df']['median'][key] = median_value
+        self.data_storage['other_parameters']['student_t_df']['std'][key] = std_value
+    
+    def _add_log_posterior_data(self, median_value: float, std_value: float) -> None:
+        """対数事後確率データを追加"""
+        self.data_storage['other_parameters']['log_posterior']['median']['log_posterior'] = median_value
+        self.data_storage['other_parameters']['log_posterior']['std']['log_posterior'] = std_value
+    
+    def build_dataframes(self) -> Dict[str, Any]:
+        """
+        構築されたデータからDataFrame辞書を作成
+        
+        Returns:
+            パラメータタイプごとのDataFrame辞書
+        """
+        result = {}
+        
+        # Item_ROICのDataFrame構築
+        if self.data_storage['Item_ROIC']['median']:
+            result['Item_ROIC'] = {
+                'median': self._build_time_series_dataframe(self.data_storage['Item_ROIC']['median']),
+                'std': self._build_time_series_dataframe(self.data_storage['Item_ROIC']['std'])
+            }
+        
+        # segment_private_effectのDataFrame構築
+        if self.data_storage['segment_private_effect']['median']:
+            result['segment_private_effect'] = {
+                'median': self._build_time_series_dataframe(self.data_storage['segment_private_effect']['median']),
+                'std': self._build_time_series_dataframe(self.data_storage['segment_private_effect']['std'])
+            }
+        
+        # consol_private_effectのDataFrame構築
+        if self.data_storage['consol_private_effect']['median']:
+            result['consol_private_effect'] = {
+                'median': self._build_time_series_dataframe(self.data_storage['consol_private_effect']['median']),
+                'std': self._build_time_series_dataframe(self.data_storage['consol_private_effect']['std'])
+            }
+        
+        # observation_errorsのDataFrame構築
+        observation_errors = {}
+        if self.data_storage['observation_errors']['segment']['median']:
+            observation_errors['segment'] = self._build_observation_error_dataframe(
+                self.data_storage['observation_errors']['segment']
+            )
+        if self.data_storage['observation_errors']['consol']['median']:
+            observation_errors['consol'] = self._build_observation_error_dataframe(
+                self.data_storage['observation_errors']['consol']
+            )
+        
+        if observation_errors:
+            result['observation_errors'] = observation_errors
+        
+        # other_parametersのSeries構築
+        other_params = {}
+        if self.data_storage['other_parameters']['student_t_df']['median']:
+            other_params['student_t_df'] = pd.Series(self.data_storage['other_parameters']['student_t_df']['median'])
+        if self.data_storage['other_parameters']['log_posterior']['median']:
+            other_params['log_posterior'] = pd.Series(self.data_storage['other_parameters']['log_posterior']['median'])
+        
+        if other_params:
+            result['other_parameters'] = other_params
+        
+        return result
+    
+    def _build_time_series_dataframe(self, data: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+        """
+        時系列DataFrameを構築
+        
+        Args:
+            data: {entity_name: {time_key: value}} の形式
+            
+        Returns:
+            時系列DataFrame
+        """
+        if not data:
+            return pd.DataFrame()
+        
+        # 全ての時点を収集
+        all_times = set()
+        for entity_data in data.values():
+            all_times.update(entity_data.keys())
+        
+        # 時点でソート
+        sorted_times = sorted(all_times, key=lambda x: int(x[1:]) if x.startswith('t') else 0)
+        
+        # DataFrameを構築
+        df_data = {}
+        for time_key in sorted_times:
+            df_data[time_key] = {}
+            for entity_name, entity_data in data.items():
+                df_data[time_key][entity_name] = entity_data.get(time_key, np.nan)
+        
+        return pd.DataFrame(df_data).T  # 転置してentity_nameをindexに
+    
+    def _build_observation_error_dataframe(self, data: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+        """
+        観測誤差DataFrameを構築
+        
+        Args:
+            data: {'median': {entity_name: value}, 'std': {entity_name: value}} の形式
+            
+        Returns:
+            観測誤差DataFrame
+        """
+        if not data['median']:
+            return pd.DataFrame()
+        
+        df_data = {}
+        for entity_name in data['median'].keys():
+            df_data[entity_name] = {
+                'median': data['median'].get(entity_name, np.nan),
+                'std': data['std'].get(entity_name, np.nan)
+            }
+        
+        return pd.DataFrame(df_data).T
+
+
 class CSVFileValidator:
     """CSVファイルの検証クラス"""
     
@@ -412,7 +675,7 @@ class CSVFileValidator:
 
 
 class CSVProcessor:
-    """CSV処理と変分推論結果統合を管理するクラス（改善版）"""
+    """CSV処理と変分推論結果統合を管理するクラス（DataFrame辞書出力版）"""
     
     def __init__(
         self, 
@@ -483,7 +746,7 @@ class CSVProcessor:
             self.logger.error(f"列情報の取得に失敗: {e}")
             raise
     
-    def _process_chunk(self, chunk_data: Tuple[List[str], Path, ProcessingConfig, str, str]) -> pd.Series:
+    def _process_chunk(self, chunk_data: Tuple[List[str], Path, ProcessingConfig, str, str]) -> Dict[str, Tuple[float, float]]:
         """
         チャンクデータを処理して統計値を計算
         
@@ -491,16 +754,9 @@ class CSVProcessor:
             chunk_data: (列名リスト, CSVパス, 設定, 製品レベル, データセットファイルパス)のタプル
             
         Returns:
-            処理結果のSeries
+            処理結果の辞書 {original_name: (median_value, std_value)}
         """
         columns, csv_path, config, product_level, dataset_file = chunk_data
-        
-        # カラム名生成器をローカルで作成
-        column_name_generator = ColumnNameGenerator(
-            product_level=product_level,
-            dataset_file=dataset_file,
-            data_loader=self.data_loader
-        )
         
         try:
             # チャンクを読み込み
@@ -514,32 +770,22 @@ class CSVProcessor:
             )
             
             if chunk_df.empty:
-                return pd.Series(dtype=config.dtype)
+                return {}
             
             # 統計値を計算
             median_series = chunk_df.median(axis=0)
             std_series = chunk_df.std(axis=0)
             
-            # 新しいカラム名を生成
-            median_names = []
-            std_names = []
-            
+            # 結果を辞書形式で返す
+            result = {}
             for col_name in chunk_df.columns:
-                median_name = column_name_generator.generate_column_name(col_name, "median", 0)
-                std_name = column_name_generator.generate_column_name(col_name, "std", 0)
-                
-                median_names.append(median_name)
-                std_names.append(std_name)
-            
-            # 結果を結合
-            result = pd.concat([median_series, std_series], axis=0)
-            result.index = median_names + std_names
+                result[col_name] = (median_series[col_name], std_series[col_name])
             
             return result
             
         except Exception as e:
             self.logger.error(f"チャンク処理エラー: {e}")
-            return pd.Series(dtype=config.dtype)
+            return {}
     
     def _split_columns(self, columns: List[str], num_chunks: int) -> List[List[str]]:
         """
@@ -582,9 +828,9 @@ class CSVProcessor:
         out_path: Union[str, Path],
         num_chunks: Optional[int] = None,
         show_progress: bool = True
-    ) -> pd.Series:
+    ) -> Dict[str, Any]:
         """
-        CSVファイルをPKLファイルに変換
+        CSVファイルをPKLファイルに変換（DataFrame辞書出力）
         
         Args:
             csv_path: 入力CSVファイルのパス
@@ -593,7 +839,7 @@ class CSVProcessor:
             show_progress: 進捗表示の有無
             
         Returns:
-            処理結果のSeries
+            パラメータタイプごとのDataFrame辞書
         """
         start_time = time.time()
         
@@ -616,8 +862,10 @@ class CSVProcessor:
             column_chunks = self._split_columns(columns, num_chunks)
             self.logger.info(f"処理チャンク数: {len(column_chunks)}")
             
+            # DataFrameBuilderを初期化
+            dataframe_builder = DataFrameBuilder(self.column_name_generator)
+            
             # 並列処理
-            results = []
             with ProcessPoolExecutor(max_workers=self.config.max_workers) as executor:
                 # タスクを投入
                 future_to_chunk = {
@@ -639,37 +887,38 @@ class CSVProcessor:
                 
                 for future in futures:
                     try:
-                        result = future.result()
-                        if not result.empty:
-                            results.append(result)
+                        chunk_result = future.result()
+                        # DataFrameBuilderにデータを追加
+                        for original_name, (median_value, std_value) in chunk_result.items():
+                            dataframe_builder.add_parameter_data(original_name, median_value, std_value)
                     except Exception as e:
                         chunk_idx = future_to_chunk[future]
                         self.logger.error(f"チャンク {chunk_idx} の処理に失敗: {e}")
             
-            # 結果を結合
-            if not results:
-                self.logger.warning("処理結果が空です")
-                final_result = pd.Series(dtype=self.config.dtype)
-            else:
-                final_result = pd.concat(results, axis=0)
+            # DataFrame辞書を構築
+            final_result = dataframe_builder.build_dataframes()
             
             # PKLファイルに保存
-            final_result.to_pickle(out_path)
+            with open(out_path, 'wb') as f:
+                pickle.dump(final_result, f)
         
         # 処理時間と結果情報をログ出力
         processing_time = time.time() - start_time
         self.logger.info(f"処理完了: {processing_time:.2f}秒")
-        self.logger.info(f"結果サイズ: {len(final_result)} 要素")
         self.logger.info(f"出力ファイル: {out_path}")
         
-        # カラム名生成設定の情報をログ出力
-        self.logger.info(f"カラム名生成設定:")
-        self.logger.info(f"- 製品レベル: {self.config.product_level}")
-        
-        # 生成されたカラム名の例を表示
-        if len(final_result) > 0:
-            sample_names = list(final_result.index[:5])
-            self.logger.info(f"生成されたカラム名の例: {sample_names}")
+        # 結果の構造をログ出力
+        self.logger.info(f"結果の構造:")
+        for key, value in final_result.items():
+            if isinstance(value, dict):
+                self.logger.info(f"- {key}: {list(value.keys())}")
+                for sub_key, sub_value in value.items():
+                    if hasattr(sub_value, 'shape'):
+                        self.logger.info(f"  - {sub_key}: {sub_value.shape}")
+                    else:
+                        self.logger.info(f"  - {sub_key}: {type(sub_value)}")
+            else:
+                self.logger.info(f"- {key}: {type(value)}")
         
         return final_result
 
@@ -772,15 +1021,31 @@ def main():
         
         # 結果の表示
         print("\n=== 処理結果 ===")
-        print(f"CSV処理結果: {len(result)} 要素")
         print(f"出力ファイル: {out_path}")
         print(f"カラム名生成設定:")
         print(f"- 製品レベル: {processor.config.product_level}")
         
-        # 生成されたカラム名の例を表示
-        if len(result) > 0:
-            sample_names = list(result.index[:3])
-            print(f"生成されたカラム名の例: {sample_names}")
+        # 結果の構造を表示
+        print("\n=== 結果の構造 ===")
+        for key, value in result.items():
+            if isinstance(value, dict):
+                print(f"{key}:")
+                for sub_key, sub_value in value.items():
+                    if hasattr(sub_value, 'shape'):
+                        print(f"  - {sub_key}: {sub_value.shape}")
+                    else:
+                        print(f"  - {sub_key}: {type(sub_value)}")
+            else:
+                print(f"{key}: {type(value)}")
+        
+        # データの例を表示
+        if 'Item_ROIC' in result and 'median' in result['Item_ROIC']:
+            print("\n=== Item_ROIC (median) の例 ===")
+            print(result['Item_ROIC']['median'].head())
+        
+        if 'segment_private_effect' in result and 'median' in result['segment_private_effect']:
+            print("\n=== segment_private_effect (median) の例 ===")
+            print(result['segment_private_effect']['median'].head())
         
     except Exception as e:
         print(f"エラーが発生しました: {e}")
