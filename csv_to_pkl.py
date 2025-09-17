@@ -47,6 +47,7 @@ from dataclasses import dataclass
 import time
 from tqdm import tqdm
 import argparse
+import pickle
 
 from gppm.core.config_manager import ConfigManager, get_logger
 import re
@@ -66,6 +67,8 @@ class ProcessingConfig:
     config_file_path: Optional[str] = None
     # カラム名生成設定
     product_level: str = 'L6'
+    # データセットファイルパス（製品名・エンティティ名マッピング用）
+    dataset_file: Optional[str] = None
     
     @classmethod
     def from_config_manager(cls, config_manager: ConfigManager) -> 'ProcessingConfig':
@@ -81,21 +84,67 @@ class ProcessingConfig:
             comment_char='#',  # デフォルト値
             skip_blank_lines=True,  # デフォルト値
             config_file_path=None,  # デフォルト値
-            product_level=config.product_level.level
+            product_level=config.product_level.level,
+            dataset_file=str(config.output.directory / config.output.files.dataset)
         )
 
 
 class ColumnNameGenerator:
     """カラム名生成クラス"""
     
-    def __init__(self, product_level: str = 'L6'):
+    def __init__(self, product_level: str = 'L6', dataset_file: Optional[str] = None):
         """
         初期化
         
         Args:
             product_level: 製品レベル（L6, L5）
+            dataset_file: データセットファイルパス（名前マッピング用）
         """
         self.product_level = product_level
+        self.dataset_file = dataset_file
+        
+        # 名前マッピング情報を読み込み
+        self.product_names = []
+        self.entity_info = {}
+        self.segment_info = {}
+        self._load_name_mappings()
+    
+    def _load_name_mappings(self):
+        """データセットファイルから名前マッピング情報を読み込み"""
+        if not self.dataset_file or not Path(self.dataset_file).exists():
+            return
+        
+        try:
+            with open(self.dataset_file, 'rb') as f:
+                dataset = pickle.load(f)
+            
+            # 製品名の読み込み
+            if 'product_names' in dataset:
+                self.product_names = dataset['product_names']
+            
+            # エンティティ情報の読み込み
+            if 'entity_info' in dataset:
+                entity_df = dataset['entity_info']
+                if isinstance(entity_df, pd.DataFrame):
+                    self.entity_info = dict(zip(
+                        range(len(entity_df)), 
+                        entity_df['FACTSET_ENTITY_ID'].tolist()
+                    ))
+            
+            # セグメント情報の読み込み（pivot_tablesから）
+            if 'pivot_tables' in dataset:
+                pivot_tables = dataset['pivot_tables']
+                if 'Y_segment' in pivot_tables:
+                    segment_df = pivot_tables['Y_segment']
+                    if hasattr(segment_df, 'index'):
+                        self.segment_info = dict(zip(
+                            range(len(segment_df.index)), 
+                            segment_df.index.tolist()
+                        ))
+            
+        except Exception as e:
+            # エラーが発生した場合は空のマッピングで続行
+            pass
     
     def parse_stan_parameter(self, column_name: str) -> Dict[str, Any]:
         """
@@ -130,6 +179,10 @@ class ColumnNameGenerator:
         else:
             param_name = column_name
             indices = []
+        
+        # パラメータ名が空の場合は解析失敗
+        if not param_name:
+            return result
         
         # パラメータタイプの判定
         if param_name == 'Item_ROIC':
@@ -208,8 +261,8 @@ class ColumnNameGenerator:
         parsed = self.parse_stan_parameter(original_name)
         
         if parsed['parameter_type'] is None:
-            # 解析できない場合は従来の形式
-            return f"{stat_type}_{index}"
+            # 解析できない場合は元の列名を使用
+            return f"{stat_type}_{original_name}"
         
         # パラメータタイプに応じてカラム名を生成
         if parsed['parameter_type'] == 'log_posterior':
@@ -218,37 +271,53 @@ class ColumnNameGenerator:
         elif parsed['parameter_type'] == 'product_roic':
             product_id = parsed.get('product_id', 'unknown')
             time_id = parsed.get('time_id', 'unknown')
-            return f"{stat_type}_product_{product_id}_roic_t{time_id}"
+            # 実際の製品名を使用
+            product_name = self._get_product_name(product_id)
+            return f"{stat_type}_product_{product_name}_roic_t{time_id}"
         
         elif parsed['parameter_type'] == 'product_roic_std':
             product_id = parsed.get('product_id', 'unknown')
-            return f"{stat_type}_product_{product_id}_roic_std"
+            # 実際の製品名を使用
+            product_name = self._get_product_name(product_id)
+            return f"{stat_type}_product_{product_name}_roic_std"
         
         elif parsed['parameter_type'] == 'segment_private_effect':
             entity_id = parsed.get('entity_id', 'unknown')
             time_id = parsed.get('time_id', 'unknown')
-            return f"{stat_type}_segment_{entity_id}_private_effect_t{time_id}"
+            # 実際のセグメント名を使用
+            segment_name = self._get_segment_name(entity_id)
+            return f"{stat_type}_segment_{segment_name}_private_effect_t{time_id}"
         
         elif parsed['parameter_type'] == 'consol_private_effect':
             entity_id = parsed.get('entity_id', 'unknown')
             time_id = parsed.get('time_id', 'unknown')
-            return f"{stat_type}_consol_{entity_id}_private_effect_t{time_id}"
+            # 実際の企業名を使用
+            company_name = self._get_company_name(entity_id)
+            return f"{stat_type}_consol_{company_name}_private_effect_t{time_id}"
         
         elif parsed['parameter_type'] == 'segment_observation_error':
             entity_id = parsed.get('entity_id', 'unknown')
-            return f"{stat_type}_segment_{entity_id}_observation_error"
+            # 実際のセグメント名を使用
+            segment_name = self._get_segment_name(entity_id)
+            return f"{stat_type}_segment_{segment_name}_observation_error"
         
         elif parsed['parameter_type'] == 'consol_observation_error':
             entity_id = parsed.get('entity_id', 'unknown')
-            return f"{stat_type}_consol_{entity_id}_observation_error"
+            # 実際の企業名を使用
+            company_name = self._get_company_name(entity_id)
+            return f"{stat_type}_consol_{company_name}_observation_error"
         
         elif parsed['parameter_type'] == 'segment_private_std':
             entity_id = parsed.get('entity_id', 'unknown')
-            return f"{stat_type}_segment_{entity_id}_private_std"
+            # 実際のセグメント名を使用
+            segment_name = self._get_segment_name(entity_id)
+            return f"{stat_type}_segment_{segment_name}_private_std"
         
         elif parsed['parameter_type'] == 'consol_private_std':
             entity_id = parsed.get('entity_id', 'unknown')
-            return f"{stat_type}_consol_{entity_id}_private_std"
+            # 実際の企業名を使用
+            company_name = self._get_company_name(entity_id)
+            return f"{stat_type}_consol_{company_name}_private_std"
         
         elif parsed['parameter_type'] == 'student_t_df':
             if parsed['is_consolidated']:
@@ -260,6 +329,39 @@ class ColumnNameGenerator:
             # その他の場合は従来の形式
             return f"{stat_type}_{index}"
     
+    def _get_product_name(self, product_id: Any) -> str:
+        """製品IDから製品名を取得"""
+        try:
+            product_id = int(product_id) - 1  # Stanのインデックスは1ベース、Pythonは0ベース
+            if 0 <= product_id < len(self.product_names):
+                return self.product_names[product_id]
+        except (ValueError, IndexError):
+            pass
+        return f"product_{product_id}"
+    
+    def _get_company_name(self, entity_id: Any) -> str:
+        """エンティティIDから企業名を取得"""
+        try:
+            # entity_idは "CONSOL_X" 形式なので、Xの部分を抽出
+            if isinstance(entity_id, str) and entity_id.startswith("CONSOL_"):
+                consol_id = int(entity_id.replace("CONSOL_", "")) - 1  # Stanのインデックスは1ベース
+                if 0 <= consol_id < len(self.entity_info):
+                    return self.entity_info[consol_id]
+        except (ValueError, IndexError):
+            pass
+        return f"company_{entity_id}"
+    
+    def _get_segment_name(self, entity_id: Any) -> str:
+        """エンティティIDからセグメント名を取得"""
+        try:
+            # entity_idは "SEG_X" 形式なので、Xの部分を抽出
+            if isinstance(entity_id, str) and entity_id.startswith("SEG_"):
+                segment_id = int(entity_id.replace("SEG_", "")) - 1  # Stanのインデックスは1ベース
+                if 0 <= segment_id < len(self.segment_info):
+                    return self.segment_info[segment_id]
+        except (ValueError, IndexError):
+            pass
+        return f"segment_{entity_id}"
 
 
 class CSVProcessor:
@@ -286,7 +388,8 @@ class CSVProcessor:
         
         # カラム名生成器を初期化
         self.column_name_generator = ColumnNameGenerator(
-            product_level=self.config.product_level
+            product_level=self.config.product_level,
+            dataset_file=self.config.dataset_file
         )
     
     
@@ -350,21 +453,22 @@ class CSVProcessor:
             self.logger.error(f"列情報の取得に失敗: {e}")
             raise
     
-    def _process_chunk(self, chunk_data: Tuple[List[str], Path, ProcessingConfig, str]) -> pd.Series:
+    def _process_chunk(self, chunk_data: Tuple[List[str], Path, ProcessingConfig, str, str]) -> pd.Series:
         """
         チャンクデータを処理して統計値を計算
         
         Args:
-            chunk_data: (列名リスト, CSVパス, 設定, 製品レベル)のタプル
+            chunk_data: (列名リスト, CSVパス, 設定, 製品レベル, データセットファイルパス)のタプル
             
         Returns:
             処理結果のSeries
         """
-        columns, csv_path, config, product_level = chunk_data
+        columns, csv_path, config, product_level, dataset_file = chunk_data
         
         # カラム名生成器をローカルで作成
         column_name_generator = ColumnNameGenerator(
-            product_level=product_level
+            product_level=product_level,
+            dataset_file=dataset_file
         )
         
         try:
@@ -466,7 +570,7 @@ class CSVProcessor:
             future_to_chunk = {
                 executor.submit(
                     self._process_chunk, 
-                    (chunk, Path(csv_path), self.config, self.config.product_level)
+                    (chunk, Path(csv_path), self.config, self.config.product_level, self.config.dataset_file)
                 ): i for i, chunk in enumerate(column_chunks)
             }
             
