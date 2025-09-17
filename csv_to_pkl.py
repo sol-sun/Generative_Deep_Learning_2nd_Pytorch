@@ -166,6 +166,7 @@ class ColumnNameGenerator:
         self.product_names: List[str] = []
         self.entity_info: Dict[int, str] = {}
         self.segment_info: Dict[int, str] = {}
+        self.time_mapping: Dict[int, str] = {}  # 時点ID -> 月次文字列のマッピング
         self._load_name_mappings()
     
     def _load_name_mappings(self) -> None:
@@ -199,9 +200,85 @@ class ColumnNameGenerator:
                             range(len(segment_df.index)), 
                             segment_df.index.tolist()
                         ))
+                
+                # 時点マッピング情報の読み込み
+                self._load_time_mapping(pivot_tables)
             
         except Exception as e:
             logging.warning(f"名前マッピングの読み込みに失敗: {e}")
+            # 時点マッピングは空のままにする
+            self.time_mapping = {}
+    
+    def _load_time_mapping(self, pivot_tables: Dict[str, pd.DataFrame]) -> None:
+        """時点マッピング情報を読み込み"""
+        try:
+            # 複数のソースから時点情報を取得を試行
+            time_columns = None
+            
+            # 1. Y_segmentから時点情報を取得
+            if 'Y_segment' in pivot_tables:
+                segment_df = pivot_tables['Y_segment']
+                if hasattr(segment_df, 'columns') and len(segment_df.columns) > 0:
+                    time_columns = segment_df.columns.tolist()
+                    logging.info(f"Y_segmentから時点情報を取得: {len(time_columns)}時点")
+            
+            # 2. Y_consolから時点情報を取得（Y_segmentで取得できない場合）
+            if time_columns is None and 'Y_consol' in pivot_tables:
+                consol_df = pivot_tables['Y_consol']
+                if hasattr(consol_df, 'columns') and len(consol_df.columns) > 0:
+                    time_columns = consol_df.columns.tolist()
+                    logging.info(f"Y_consolから時点情報を取得: {len(time_columns)}時点")
+            
+            # 3. X2_segmentから時点情報を取得（MultiIndexの場合）
+            if time_columns is None and 'X2_segment' in pivot_tables:
+                x2_segment_df = pivot_tables['X2_segment']
+                if hasattr(x2_segment_df, 'index') and isinstance(x2_segment_df.index, pd.MultiIndex):
+                    # MultiIndexの2番目のレベル（時点）を取得
+                    time_levels = x2_segment_df.index.get_level_values(1).unique().tolist()
+                    if time_levels:
+                        time_columns = time_levels
+                        logging.info(f"X2_segmentから時点情報を取得: {len(time_columns)}時点")
+            
+            # 時点情報が見つかった場合、マッピングを作成
+            if time_columns:
+                self.time_mapping = self._create_time_mapping(time_columns)
+                logging.info(f"時点マッピングを作成しました: {self.time_mapping}")
+            else:
+                # 時点マッピングは空のままにする
+                self.time_mapping = {}
+                logging.warning("時点情報が見つかりませんでした。時点マッピングは空です。")
+                logging.warning("利用可能なピボットテーブル: " + ", ".join(pivot_tables.keys()))
+                
+        except Exception as e:
+            logging.warning(f"時点マッピングの読み込みに失敗: {e}")
+            # 時点マッピングは空のままにする
+            self.time_mapping = {}
+            logging.warning("時点マッピングは空です。")
+    
+    def _create_time_mapping(self, time_columns: List) -> Dict[int, str]:
+        """時点IDから月次文字列へのマッピングを作成"""
+        time_mapping = {}
+        
+        for i, time_value in enumerate(time_columns):
+            try:
+                # DatetimeIndexの場合（pandas.Timestamp）
+                if hasattr(time_value, 'strftime'):
+                    time_mapping[i] = time_value.strftime('%Y-%m')
+                else:
+                    # その他の場合は元の値をそのまま使用
+                    time_mapping[i] = str(time_value)
+            except Exception as e:
+                logging.warning(f"時点値の変換に失敗: {time_value}, エラー: {e}")
+                time_mapping[i] = str(time_value)
+        
+        return time_mapping
+    
+    def get_time_string(self, time_id: int) -> str:
+        """時点IDから月次文字列を取得"""
+        if not self.time_mapping:
+            # 時点マッピングが空の場合は、t{time_id}形式を返す
+            return f"t{time_id}"
+        return self.time_mapping.get(time_id, f"t{time_id}")
     
     def parse_stan_parameter(self, column_name: str) -> Dict[str, Any]:
         """
@@ -469,7 +546,7 @@ class DataFrameBuilder:
         
         if product_id is not None and time_id is not None:
             product_name = self.column_name_generator._get_product_name(product_id)
-            time_key = f"t{time_id}"
+            time_key = self.column_name_generator.get_time_string(time_id)
             
             if product_name not in self.data_storage['Item_ROIC']['median']:
                 self.data_storage['Item_ROIC']['median'][product_name] = {}
@@ -485,7 +562,7 @@ class DataFrameBuilder:
         
         if entity_id is not None and time_id is not None:
             segment_name = self.column_name_generator._get_segment_name(entity_id)
-            time_key = f"t{time_id}"
+            time_key = self.column_name_generator.get_time_string(time_id)
             
             if segment_name not in self.data_storage['segment_private_effect']['median']:
                 self.data_storage['segment_private_effect']['median'][segment_name] = {}
@@ -501,7 +578,7 @@ class DataFrameBuilder:
         
         if entity_id is not None and time_id is not None:
             company_name = self.column_name_generator._get_company_name(entity_id)
-            time_key = f"t{time_id}"
+            time_key = self.column_name_generator.get_time_string(time_id)
             
             if company_name not in self.data_storage['consol_private_effect']['median']:
                 self.data_storage['consol_private_effect']['median'][company_name] = {}
@@ -609,8 +686,25 @@ class DataFrameBuilder:
         for entity_data in data.values():
             all_times.update(entity_data.keys())
         
-        # 時点でソート
-        sorted_times = sorted(all_times, key=lambda x: int(x[1:]) if x.startswith('t') else 0)
+        # 時点でソート（月次形式を考慮）
+        def time_sort_key(time_str):
+            if time_str.startswith('t'):
+                # t1, t2形式の場合は数値でソート
+                try:
+                    return int(time_str[1:])
+                except ValueError:
+                    return 0
+            elif '-' in time_str and len(time_str) == 7:
+                # 2023-01形式の場合は年月でソート
+                try:
+                    year, month = time_str.split('-')
+                    return int(year) * 12 + int(month)
+                except ValueError:
+                    return 0
+            else:
+                return 0
+        
+        sorted_times = sorted(all_times, key=time_sort_key)
         
         # DataFrameを構築（entity_nameをindex、time_keyをcolumnsに）
         df_data = {}
