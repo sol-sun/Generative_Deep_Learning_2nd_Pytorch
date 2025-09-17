@@ -41,6 +41,7 @@ import time
 from tqdm import tqdm
 import yaml
 import pickle
+import argparse
 
 from gppm.core.config_manager import ConfigManager, get_logger
 
@@ -67,14 +68,14 @@ class ProcessingConfig:
         
         return cls(
             chunk_size=1000,  # デフォルト値
-            max_workers=config.processing.max_workers,
-            memory_limit_mb=1024,  # デフォルト値
-            dtype='object',  # デフォルト値
+            max_workers=config.data_processing.parallel_workers,
+            memory_limit_mb=config.data_processing.memory_limit_mb,
+            dtype=config.data_processing.data_type,
             engine='c',  # デフォルト値
             comment_char='#',  # デフォルト値
             skip_blank_lines=True,  # デフォルト値
             bayesian_result_path=None,  # デフォルト値
-            bayesian_output_dir=config.output.base_directory,
+            bayesian_output_dir=config.output.directory,
             config_file_path=None  # デフォルト値
         )
 
@@ -122,8 +123,8 @@ class CSVProcessor:
             config = self.config_manager.get_config()
             
             return BayesianConfig(
-                result_path=None,  # デフォルト値
-                output_dir=config.output.base_directory,
+                result_path=config.variational_inference.existing_result_path,
+                output_dir=config.output.directory,
                 model={},  # デフォルト値
                 variational={}  # デフォルト値
             )
@@ -411,9 +412,9 @@ class CSVProcessor:
             
             # 設定ファイルから統合結果の出力パスを取得
             config = self.config_manager.get_config()
-            output_dir = Path(config.output.base_directory)
+            output_dir = Path(config.output.directory)
             output_dir.mkdir(parents=True, exist_ok=True)
-            integrated_path = output_dir / "integrated_analysis_result.pkl"
+            integrated_path = output_dir / config.output.files.integrated
             
             integrated_result.to_pickle(integrated_path)
             results['integrated'] = integrated_result
@@ -422,8 +423,62 @@ class CSVProcessor:
         return results
 
 
+def parse_arguments():
+    """コマンドライン引数を解析"""
+    parser = argparse.ArgumentParser(
+        description="CSV処理と変分推論結果統合ツール",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用例:
+  # 設定ファイルのCSVファイルパスを使用
+  python csv_to_pkl.py
+  
+  # コマンドライン引数でCSVファイルパスを指定
+  python csv_to_pkl.py --csv-file /path/to/input.csv
+  
+  # 出力パスも指定
+  python csv_to_pkl.py --csv-file /path/to/input.csv --output /path/to/output.pkl
+        """
+    )
+    
+    parser.add_argument(
+        '--csv-file', '-i',
+        type=str,
+        help='入力CSVファイルのパス（設定ファイルで指定されていない場合に必要）'
+    )
+    
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        help='出力PKLファイルのパス（設定ファイルの出力設定を使用する場合は省略可能）'
+    )
+    
+    parser.add_argument(
+        '--variational-result', '-v',
+        type=str,
+        help='変分推論結果ファイルのパス（設定ファイルで指定されていない場合に使用）'
+    )
+    
+    parser.add_argument(
+        '--chunks', '-c',
+        type=int,
+        help='処理チャンク数（自動決定する場合は省略）'
+    )
+    
+    parser.add_argument(
+        '--no-progress',
+        action='store_true',
+        help='進捗表示を無効にする'
+    )
+    
+    return parser.parse_args()
+
+
 def main():
     """メイン実行関数"""
+    # コマンドライン引数を解析
+    args = parse_arguments()
+    
     # ConfigManagerを使用して設定を読み込み
     config_manager = ConfigManager()
     config = config_manager.get_config()
@@ -431,24 +486,44 @@ def main():
     # プロセッサー初期化（ConfigManagerから設定を自動読み込み）
     processor = CSVProcessor(config_manager=config_manager)
     
-    # 設定ファイルから出力パスを取得
-    output_dir = Path(config.output.base_directory)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # CSVファイルパスの決定（優先順位: コマンドライン引数 > 設定ファイル）
+    csv_path = args.csv_file or config.csv_processing.input_file
+    if csv_path is None:
+        print("エラー: CSVファイルパスが指定されていません。")
+        print("設定ファイル（gppm_config.yml）のcsv_processing.input_fileにパスを設定するか、")
+        print("コマンドライン引数 --csv-file でパスを指定してください。")
+        sys.exit(1)
     
-    # ファイルパス（例 - 実際の使用時は設定ファイルまたはコマンドライン引数で指定）
-    csv_path = '/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202505/item_roic_rbics/result/Item_ROIC_Item_Beta-20250627033115.csv'
-    out_path = output_dir / "csv_processed_result.pkl"
+    # 出力パスの決定（優先順位: コマンドライン引数 > 設定ファイル）
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        output_dir = Path(config.output.directory)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / config.output.files.csv_processed
+    
+    # 変分推論結果パスの決定（優先順位: コマンドライン引数 > 設定ファイル）
+    variational_result_path = args.variational_result or config.variational_inference.existing_result_path
     
     try:
         # 統合処理の実行
-        results = processor.process_csv_with_variational_integration(csv_path, out_path)
+        results = processor.process_csv_with_variational_integration(
+            csv_path=csv_path,
+            out_path=out_path,
+            variational_result_path=variational_result_path,
+            num_chunks=args.chunks,
+            show_progress=not args.no_progress
+        )
         
         # 結果の表示
+        print("\n=== 処理結果 ===")
         for key, result in results.items():
             if isinstance(result, pd.Series):
                 print(f"{key}: {len(result)} 要素")
             else:
                 print(f"{key}: {result}")
+        
+        print(f"\n出力ファイル: {out_path}")
         
     except Exception as e:
         print(f"エラーが発生しました: {e}")
