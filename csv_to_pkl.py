@@ -29,6 +29,20 @@ CmdStanPyの出力CSVファイルを効率的に処理し、Stanパラメータ�
     'other_parameters': {
         'student_t_df': Series,
         'log_posterior': Series
+    },
+    'actual_roic': {
+        'Y_segment': DataFrame(index=セグメント名, columns=時点),
+        'Y_consol': DataFrame(index=企業名, columns=時点)
+    },
+    'predicted_roic': {
+        'Y_segment': {
+            'median': DataFrame(index=セグメント名, columns=時点),
+            'std': DataFrame(index=セグメント名, columns=時点)
+        },
+        'Y_consol': {
+            'median': DataFrame(index=企業名, columns=時点),
+            'std': DataFrame(index=企業名, columns=時点)
+        }
     }
 }
 
@@ -516,8 +530,47 @@ class DataFrameBuilder:
             'other_parameters': {
                 'student_t_df': {'median': {}, 'std': {}},
                 'log_posterior': {'median': {}, 'std': {}}
+            },
+            'actual_roic': {
+                'Y_segment': None,
+                'Y_consol': None
+            },
+            'predicted_roic': {
+                'Y_segment': {'median': {}, 'std': {}},
+                'Y_consol': {'median': {}, 'std': {}}
             }
         }
+        
+        # データセットファイルから実績ROICデータを読み込み
+        self._load_actual_roic_data()
+    
+    def _load_actual_roic_data(self) -> None:
+        """データセットファイルから実績ROICデータを読み込み"""
+        try:
+            if not self.column_name_generator.dataset_file or not Path(self.column_name_generator.dataset_file).exists():
+                logging.warning("データセットファイルが存在しません。実績ROICデータは読み込まれません。")
+                return
+            
+            # データセットファイルを読み込み
+            with open(self.column_name_generator.dataset_file, 'rb') as f:
+                dataset = pickle.load(f)
+            
+            # ピボットテーブルから実績ROICデータを取得
+            if 'pivot_tables' in dataset:
+                pivot_tables = dataset['pivot_tables']
+                
+                # Y_segmentの実績ROICデータ
+                if 'Y_segment' in pivot_tables:
+                    self.data_storage['actual_roic']['Y_segment'] = pivot_tables['Y_segment'].copy()
+                    logging.info(f"Y_segmentの実績ROICデータを読み込みました: {pivot_tables['Y_segment'].shape}")
+                
+                # Y_consolの実績ROICデータ
+                if 'Y_consol' in pivot_tables:
+                    self.data_storage['actual_roic']['Y_consol'] = pivot_tables['Y_consol'].copy()
+                    logging.info(f"Y_consolの実績ROICデータを読み込みました: {pivot_tables['Y_consol'].shape}")
+            
+        except Exception as e:
+            logging.warning(f"実績ROICデータの読み込みに失敗: {e}")
     
     def add_parameter_data(self, original_name: str, median_value: float, std_value: float) -> None:
         """
@@ -674,6 +727,21 @@ class DataFrameBuilder:
         if other_params:
             result['other_parameters'] = other_params
         
+        # 実績ROICデータの追加
+        if self.data_storage['actual_roic']['Y_segment'] is not None:
+            result['actual_roic'] = {
+                'Y_segment': self.data_storage['actual_roic']['Y_segment']
+            }
+        if self.data_storage['actual_roic']['Y_consol'] is not None:
+            if 'actual_roic' not in result:
+                result['actual_roic'] = {}
+            result['actual_roic']['Y_consol'] = self.data_storage['actual_roic']['Y_consol']
+        
+        # 推測ROICデータの計算と追加
+        predicted_roic = self._calculate_predicted_roic()
+        if predicted_roic:
+            result['predicted_roic'] = predicted_roic
+        
         return result
     
     def _build_time_series_dataframe(self, data: Dict[str, Dict[str, float]]) -> pd.DataFrame:
@@ -744,6 +812,161 @@ class DataFrameBuilder:
             }
         
         return pd.DataFrame(df_data).T  # 転置してentity_nameをindexに
+    
+    def _calculate_predicted_roic(self) -> Dict[str, Any]:
+        """
+        推測ROICを計算（Stanモデルの式に基づく）
+        
+        Returns:
+            推測ROICデータの辞書
+        """
+        try:
+            # データセットファイルからシェアデータを読み込み
+            if not self.column_name_generator.dataset_file or not Path(self.column_name_generator.dataset_file).exists():
+                logging.warning("データセットファイルが存在しません。推測ROICは計算されません。")
+                return {}
+            
+            with open(self.column_name_generator.dataset_file, 'rb') as f:
+                dataset = pickle.load(f)
+            
+            if 'pivot_tables' not in dataset:
+                logging.warning("ピボットテーブルが見つかりません。推測ROICは計算されません。")
+                return {}
+            
+            pivot_tables = dataset['pivot_tables']
+            result = {}
+            
+            # セグメント推測ROICの計算
+            if ('X2_segment' in pivot_tables and 
+                self.data_storage['Item_ROIC']['median'] and 
+                self.data_storage['segment_private_effect']['median']):
+                
+                segment_predicted = self._calculate_segment_predicted_roic(pivot_tables)
+                if segment_predicted:
+                    result['Y_segment'] = segment_predicted
+            
+            # 連結推測ROICの計算
+            if ('X2_consol' in pivot_tables and 
+                self.data_storage['Item_ROIC']['median'] and 
+                self.data_storage['consol_private_effect']['median']):
+                
+                consol_predicted = self._calculate_consol_predicted_roic(pivot_tables)
+                if consol_predicted:
+                    result['Y_consol'] = consol_predicted
+            
+            return result
+            
+        except Exception as e:
+            logging.warning(f"推測ROICの計算に失敗: {e}")
+            return {}
+    
+    def _calculate_segment_predicted_roic(self, pivot_tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """セグメント推測ROICを計算"""
+        try:
+            # 必要なデータを取得
+            X2_segment = pivot_tables['X2_segment']  # セグメント×製品シェア
+            item_roic_median = self._build_time_series_dataframe(self.data_storage['Item_ROIC']['median'])
+            segment_private_median = self._build_time_series_dataframe(self.data_storage['segment_private_effect']['median'])
+            
+            if item_roic_std := self._build_time_series_dataframe(self.data_storage['Item_ROIC']['std']):
+                item_roic_std = item_roic_std
+            else:
+                item_roic_std = None
+            
+            if segment_private_std := self._build_time_series_dataframe(self.data_storage['segment_private_effect']['std']):
+                segment_private_std = segment_private_std
+            else:
+                segment_private_std = None
+            
+            # 推測ROICを計算: mu = Share * Item_ROIC + segment_private_eff
+            predicted_median = self._calculate_weighted_roic(X2_segment, item_roic_median, segment_private_median)
+            predicted_std = None
+            
+            if item_roic_std is not None and segment_private_std is not None:
+                predicted_std = self._calculate_weighted_roic(X2_segment, item_roic_std, segment_private_std)
+            
+            result = {'median': predicted_median}
+            if predicted_std is not None:
+                result['std'] = predicted_std
+            
+            return result
+            
+        except Exception as e:
+            logging.warning(f"セグメント推測ROICの計算に失敗: {e}")
+            return {}
+    
+    def _calculate_consol_predicted_roic(self, pivot_tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """連結推測ROICを計算"""
+        try:
+            # 必要なデータを取得
+            X2_consol = pivot_tables['X2_consol']  # 連結×製品シェア
+            item_roic_median = self._build_time_series_dataframe(self.data_storage['Item_ROIC']['median'])
+            consol_private_median = self._build_time_series_dataframe(self.data_storage['consol_private_effect']['median'])
+            
+            if item_roic_std := self._build_time_series_dataframe(self.data_storage['Item_ROIC']['std']):
+                item_roic_std = item_roic_std
+            else:
+                item_roic_std = None
+            
+            if consol_private_std := self._build_time_series_dataframe(self.data_storage['consol_private_effect']['std']):
+                consol_private_std = consol_private_std
+            else:
+                consol_private_std = None
+            
+            # 推測ROICを計算: mu_consol = Share_consol * Item_ROIC + consol_private_eff
+            predicted_median = self._calculate_weighted_roic(X2_consol, item_roic_median, consol_private_median)
+            predicted_std = None
+            
+            if item_roic_std is not None and consol_private_std is not None:
+                predicted_std = self._calculate_weighted_roic(X2_consol, item_roic_std, consol_private_std)
+            
+            result = {'median': predicted_median}
+            if predicted_std is not None:
+                result['std'] = predicted_std
+            
+            return result
+            
+        except Exception as e:
+            logging.warning(f"連結推測ROICの計算に失敗: {e}")
+            return {}
+    
+    def _calculate_weighted_roic(self, share_data: pd.DataFrame, item_roic: pd.DataFrame, private_effect: pd.DataFrame) -> pd.DataFrame:
+        """
+        加重ROICを計算: Share * Item_ROIC + private_effect
+        
+        Args:
+            share_data: シェアデータ（MultiIndex: entity, time）
+            item_roic: 製品ROICデータ（index: product, columns: time）
+            private_effect: プライベート効果データ（index: entity, columns: time）
+            
+        Returns:
+            推測ROICデータ（index: entity, columns: time）
+        """
+        try:
+            # 時点ごとに計算
+            result_data = {}
+            
+            for time_col in item_roic.columns:
+                if time_col in share_data.index.get_level_values(1):
+                    # 該当時点のシェアデータを取得
+                    time_share = share_data.xs(time_col, level=1)
+                    
+                    # 該当時点の製品ROICを取得
+                    time_item_roic = item_roic[time_col]
+                    
+                    # 該当時点のプライベート効果を取得
+                    time_private = private_effect[time_col] if time_col in private_effect.columns else pd.Series(0, index=private_effect.index)
+                    
+                    # 加重ROICを計算: Share * Item_ROIC + private_effect
+                    weighted_roic = time_share.dot(time_item_roic) + time_private
+                    
+                    result_data[time_col] = weighted_roic
+            
+            return pd.DataFrame(result_data)
+            
+        except Exception as e:
+            logging.warning(f"加重ROICの計算に失敗: {e}")
+            return pd.DataFrame()
 
 
 class CSVFileValidator:
