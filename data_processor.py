@@ -12,6 +12,8 @@ import pickle
 from pathlib import Path
 import os
 import time
+import gc
+import psutil
 
 from gppm.core.data_manager import FactSetDataManager
 from gppm.analysis.financial_metrics.roic_calculator import ROICCalculator
@@ -144,29 +146,55 @@ class BayesianDataProcessor:
             
             wacc_consol_data = wacc_results['processed_data'][wacc_calculation_cols].copy()
             
-            logger.info(f"WACC計算完了: {len(wacc_consol_data)} 件")
+            # メモリ使用量のログ出力
+            memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+            logger.info(f"WACC計算完了: {len(wacc_consol_data)} 件 (メモリ使用量: {memory_usage:.1f}MB)")
+            
+            # 不要なWACC結果データを削除してメモリを解放
+            del wacc_results
+            gc.collect()
         else:
             logger.error("WACC計算でエラーが発生しました")
             wacc_consol_data = pd.DataFrame()
         
         # セグメントデータの構築
+        logger.info("セグメントデータ構築開始...")
         segment_data = self._prepare_segment_data(segment_scores, segment_roic)
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"セグメントデータ構築完了: {len(segment_data)} 件 (メモリ使用量: {memory_usage:.1f}MB)")
         
         # 連結データの構築（ROICとWACCを統合）
+        logger.info("連結データ構築開始...")
         consol_data = self._prepare_consol_data(initial_data["financial"], consol_roic, wacc_consol_data)
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"連結データ構築完了: {len(consol_data)} 件 (メモリ使用量: {memory_usage:.1f}MB)")
         
         # ピボットテーブルの作成
+        logger.info("ピボットテーブル作成開始...")
         pivot_data = product_calc.create_pivot_tables(
             segment_scores, 
             initial_data["rbics_master"]
         )
         
+        # 不要なデータを削除してメモリを解放
+        del segment_scores, segment_roic, consol_roic
+        gc.collect()
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"ピボットテーブル作成完了 (メモリ使用量: {memory_usage:.1f}MB)")
+        
         # 製品シェアデータの構築
+        logger.info("製品シェアデータ構築開始...")
         segment_product_share = self._prepare_product_share(pivot_data['segment_l5'])
         consol_product_share = self._prepare_product_share(pivot_data['consol_l5'])
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"製品シェアデータ構築完了 (メモリ使用量: {memory_usage:.1f}MB)")
         
         # 製品名の抽出
         product_names = list(pivot_data['segment_l5'].columns)
+        
+        # 不要なピボットデータを削除してメモリを解放
+        del pivot_data
+        gc.collect()
         
         result_data = {
             'segment': segment_data,
@@ -290,6 +318,13 @@ class BayesianDataProcessor:
                 except:
                     # 変換に失敗した場合は直接YYYYMM形式として処理
                     result['FTERM_2'] = result['FTERM_2'].astype(str).str.replace('-', '').str[:6].astype(int)
+        
+        # データ型を最適化してメモリ使用量を削減
+        for col in result.columns:
+            if result[col].dtype == 'float64':
+                result[col] = pd.to_numeric(result[col], downcast='float')
+            elif result[col].dtype == 'int64':
+                result[col] = pd.to_numeric(result[col], downcast='integer')
         
         return result
     
@@ -522,6 +557,7 @@ class BayesianDataProcessor:
         pivot_tables = {}
         
         # セグメントROICピボット
+        logger.info("セグメントROICピボットテーブル作成中...")
         pivot_tables['Y_segment'] = pd.pivot_table(
             data=data['segment'],
             columns=["FTERM_2"],
@@ -529,6 +565,8 @@ class BayesianDataProcessor:
             values="SEG_ROIC(運用ベース)",
         )
         pivot_tables['Y_segment'].sort_index(inplace=True)
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"セグメントROICピボット完了: {pivot_tables['Y_segment'].shape} (メモリ使用量: {memory_usage:.1f}MB)")
             
         # 連結ROICピボット
         logger.info(f"連結ROICピボットテーブル作成開始: {len(data['consol'])} エンティティ")
@@ -539,10 +577,12 @@ class BayesianDataProcessor:
             values="ROIC(運用ベース)",
         )
         pivot_tables['Y_consol'].sort_index(inplace=True)
-        logger.info(f"連結ROICピボットテーブル作成完了: {pivot_tables['Y_consol'].shape}")
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"連結ROICピボットテーブル作成完了: {pivot_tables['Y_consol'].shape} (メモリ使用量: {memory_usage:.1f}MB)")
         
         # 連結WACCピボット
         if 'WACC' in data['consol'].columns:
+            logger.info("WACCピボットテーブル作成中...")
             pivot_tables['Y_consol_wacc'] = pd.pivot_table(
                 data=data['consol'],
                 columns=["FTERM_2"],
@@ -550,11 +590,13 @@ class BayesianDataProcessor:
                 values="WACC",
             )
             pivot_tables['Y_consol_wacc'].sort_index(inplace=True)
-            logger.info(f"WACC ピボットテーブル作成: {pivot_tables['Y_consol_wacc'].shape}")
+            memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+            logger.info(f"WACC ピボットテーブル作成: {pivot_tables['Y_consol_wacc'].shape} (メモリ使用量: {memory_usage:.1f}MB)")
         else:
             logger.warning("WACC データが見つかりません - ピボットテーブルをスキップ")
         
         # セグメント製品シェアピボット
+        logger.info("セグメント製品シェアピボットテーブル作成中...")
         pivot_tables['X2_segment'] = (
             data['segment_product_share'][
                 ["CODE_SEGMENT_ADJ", "FTERM_2", *prod_names]
@@ -570,8 +612,11 @@ class BayesianDataProcessor:
             .to_numpy()
         )
         pivot_tables['X2_segment'].sort_index(inplace=True)
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"セグメント製品シェアピボット完了: {pivot_tables['X2_segment'].shape} (メモリ使用量: {memory_usage:.1f}MB)")
             
         # 連結製品シェアピボット
+        logger.info("連結製品シェアピボットテーブル作成中...")
         pivot_tables['X2_consol'] = (
             data['consol_product_share'][
                 ["FACTSET_ENTITY_ID", "FTERM_2", *prod_names]
@@ -587,6 +632,8 @@ class BayesianDataProcessor:
             .to_numpy()
         )
         pivot_tables['X2_consol'].sort_index(inplace=True)
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"連結製品シェアピボット完了: {pivot_tables['X2_consol'].shape} (メモリ使用量: {memory_usage:.1f}MB)")
         
         # 元のnotebookと完全に同様の処理
         
@@ -928,6 +975,10 @@ class BayesianDataProcessor:
                 'n_time_periods': stan_data['Time_N']
             }
         }
+        
+        # 最終メモリ使用量の確認
+        final_memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"最終メモリ使用量: {final_memory_usage:.1f}MB")
         
         # 保存
         if save_path:
