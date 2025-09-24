@@ -153,6 +153,9 @@ class BayesianDataProcessor:
         
         # WACC計算（連結のみ）
         logger.info("WACC計算を実行中...")
+        logger.info(f"財務データ件数: {len(initial_data['financial'])} 件")
+        logger.info(f"エンティティデータ件数: {len(initial_data['entity'])} 件")
+        
         wacc_config = WACCColumnConfig()
         wacc_calculator = WACCCalculator(config=wacc_config)
         
@@ -183,15 +186,25 @@ class BayesianDataProcessor:
         )
         
         # WACC計算結果を取得
-        wacc_results = wacc_calculator.calculate_wacc_from_merged_data(
-            wacc_financial_data,
-            cost_of_equity=WACC_DEFAULT_COST_OF_EQUITY,
-            tax_rate=WACC_DEFAULT_TAX_RATE
-        )
-        logger.debug(wacc_results)
+        logger.info(f"WACC計算開始: {len(wacc_financial_data)} 件のデータを処理中...")
+        
+        try:
+            wacc_results = wacc_calculator.calculate_wacc_from_merged_data(
+                wacc_financial_data,
+                cost_of_equity=WACC_DEFAULT_COST_OF_EQUITY,
+                tax_rate=WACC_DEFAULT_TAX_RATE
+            )
+            logger.info("WACC計算が正常に完了しました")
+            logger.debug(f"WACC計算結果のキー: {list(wacc_results.keys())}")
+        except Exception as e:
+            logger.error(f"WACC計算中にエラーが発生: {e}")
+            wacc_results = {'processed_data': pd.DataFrame()}
         
         # WACC結果から連結データを抽出
         if 'processed_data' in wacc_results and 'WACC' in wacc_results['processed_data'].columns:
+            logger.info(f"WACC計算結果を処理中: {len(wacc_results['processed_data'])} 件")
+            
+            # メモリ効率を考慮した列選択
             wacc_calculation_cols = [
                 'FACTSET_ENTITY_ID', 'FTERM_2', 'FISCAL_YEAR', 'WACC',
                 '時価総額', '平均有利子負債', '企業価値',
@@ -199,9 +212,28 @@ class BayesianDataProcessor:
                 '負債コスト(税引前)', '実効税率'
             ]
             
-            wacc_consol_data = wacc_results['processed_data'][wacc_calculation_cols].copy()
+            # 利用可能な列のみを選択
+            available_cols = [col for col in wacc_calculation_cols if col in wacc_results['processed_data'].columns]
+            
+            # データ型を最適化してメモリ使用量を削減
+            wacc_consol_data = wacc_results['processed_data'][available_cols].copy()
+            
+            # データ型の最適化
+            if 'FACTSET_ENTITY_ID' in wacc_consol_data.columns:
+                wacc_consol_data['FACTSET_ENTITY_ID'] = wacc_consol_data['FACTSET_ENTITY_ID'].astype('category')
+            
+            # 数値列の最適化
+            numeric_cols = wacc_consol_data.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                if col != 'FACTSET_ENTITY_ID':
+                    wacc_consol_data[col] = pd.to_numeric(wacc_consol_data[col], errors='coerce')
             
             logger.info(f"WACC計算完了: {len(wacc_consol_data)} 件")
+            
+            # メモリ使用量の確認
+            memory_usage = wacc_consol_data.memory_usage(deep=True).sum() / 1024**2  # MB
+            logger.info(f"WACCデータメモリ使用量: {memory_usage:.2f} MB")
+            
         else:
             logger.error("WACC計算でエラーが発生しました")
             wacc_consol_data = pd.DataFrame()
@@ -377,13 +409,57 @@ class BayesianDataProcessor:
         
         # WACCデータも追加（ある場合）
         if wacc_data is not None and not wacc_data.empty:
-            # WACCデータとマージ
-            result = result.merge(
-                wacc_data,  # 全ての計算詳細列を含める
-                on=['FACTSET_ENTITY_ID', 'FTERM_2'],
-                how='left'  # ROICに合わせてleft join
-            )
-            logger.info(f"WACCデータを連結データに統合: {result['WACC'].notna().sum()} 件")
+            logger.info(f"WACCデータ統合開始: ROICデータ {len(result)} 件, WACCデータ {len(wacc_data)} 件")
+            
+            # メモリ効率を考慮したマージ処理
+            try:
+                # 必要な列のみを選択してメモリ使用量を削減
+                wacc_essential_cols = ['FACTSET_ENTITY_ID', 'FTERM_2', 'WACC']
+                wacc_subset = wacc_data[wacc_essential_cols].copy()
+                
+                # データ型を最適化
+                wacc_subset['FACTSET_ENTITY_ID'] = wacc_subset['FACTSET_ENTITY_ID'].astype('category')
+                result['FACTSET_ENTITY_ID'] = result['FACTSET_ENTITY_ID'].astype('category')
+                
+                # 段階的なマージ処理
+                logger.info("WACCデータのマージ処理を実行中...")
+                
+                # 大量データの場合は分割処理
+                if len(result) > 100000:
+                    logger.info("大量データのため分割処理を実行します")
+                    chunk_size = 50000
+                    merged_chunks = []
+                    
+                    for i in range(0, len(result), chunk_size):
+                        chunk = result.iloc[i:i+chunk_size].copy()
+                        merged_chunk = chunk.merge(
+                            wacc_subset,
+                            on=['FACTSET_ENTITY_ID', 'FTERM_2'],
+                            how='left'
+                        )
+                        merged_chunks.append(merged_chunk)
+                        logger.info(f"チャンク {i//chunk_size + 1}/{(len(result)-1)//chunk_size + 1} 完了")
+                    
+                    result = pd.concat(merged_chunks, ignore_index=True)
+                    del merged_chunks
+                else:
+                    result = result.merge(
+                        wacc_subset,
+                        on=['FACTSET_ENTITY_ID', 'FTERM_2'],
+                        how='left'
+                    )
+                
+                # メモリクリーンアップ
+                del wacc_subset
+                
+                logger.info(f"WACCデータを連結データに統合完了: {result['WACC'].notna().sum()} 件")
+                
+            except MemoryError:
+                logger.error("メモリ不足のため、WACCデータの統合をスキップします")
+                result['WACC'] = np.nan
+            except Exception as e:
+                logger.error(f"WACCデータ統合中にエラーが発生: {e}")
+                result['WACC'] = np.nan
         else:
             # WACCデータがない場合はNaNで埋める
             result['WACC'] = np.nan
@@ -1130,6 +1206,11 @@ class BayesianDataProcessor:
             logger.info("1. FactSetDataManagerからデータ取得中...")
             data = self.load_from_data_manager(data_manager)
             monitor.set_final_data(data['consol'], entity_id_col="FACTSET_ENTITY_ID")
+            
+            # メモリ使用量の確認
+            import psutil
+            memory_info = psutil.virtual_memory()
+            logger.info(f"メモリ使用状況: {memory_info.percent:.1f}% 使用中 ({memory_info.available / 1024**3:.1f} GB 利用可能)")
         
         # 2. Entity情報の準備（国別可視化用）
         with monitor_data_processing("Entity情報準備", logger) as monitor:
