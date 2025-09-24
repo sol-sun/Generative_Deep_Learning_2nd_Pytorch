@@ -1,53 +1,29 @@
 """
 ベイジアンモデリング用データ前処理モジュール
 
-FactSetデータからStanモデリング用のデータ構造を作成する。
-このモジュールは、財務データの前処理、ROIC/WACC計算、
-製品シェアデータの統合、Stan用データ構造の生成を行う。
-
-Classes:
-    BayesianDataProcessor: ベイジアンモデリング用データ前処理のメインクラス
-
-Constants:
-    DEFAULT_MAPPING_PATH (str): デフォルトのマッピングファイルパス
-    MAJOR_COUNTRIES (List[str]): 主要国の国コードリスト
-    QUARTER_MAPPING (Dict[int, int]): 月から四半期へのマッピング
-    PREDICTION_PERIODS (int): 予測期間数（四半期単位）
-    WACC_DEFAULT_COST_OF_EQUITY (float): デフォルトの株主資本コスト
-    WACC_DEFAULT_TAX_RATE (float): デフォルトの法人税率
+FactSetデータからStanモデリング用のデータ構造を作成する
 """
 
-import os
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from typing import Dict, List, Tuple, Optional
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+import os
+import time
 
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
-
-from gppm.analysis.financial_metrics.product_score_calculator import ProductScoreCalculator
+from gppm.core.data_manager import FactSetDataManager
 from gppm.analysis.financial_metrics.roic_calculator import ROICCalculator
 from gppm.analysis.risk_capital.wacc_calculator import WACCCalculator, WACCColumnConfig
-from gppm.core.config_manager import get_logger
-from gppm.core.data_manager import FactSetDataManager
-from gppm.core.monitoring import monitor_data_processing
-from gppm.utils.country_code_manager import get_country_name
 from gppm.utils.country_risk_parameters import get_country_risk_manager
+from gppm.analysis.financial_metrics.product_score_calculator import ProductScoreCalculator
 from gppm.utils.geographic_processor import GeographicProcessor
+from gppm.utils.country_code_manager import get_country_name
+from gppm.core.config_manager import get_logger
+from gppm.core.monitoring import monitor_data_processing
 
-# 定数定義
-DEFAULT_MAPPING_PATH = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202501/mapping_df.pkl"
-MAJOR_COUNTRIES = ['US', 'JP', 'CN', 'DE', 'GB', 'FR', 'IT', 'CA', 'AU', 'BR', 'IN', 'KR']
-QUARTER_MAPPING = {
-    1: 3, 2: 3, 3: 3, 4: 6, 5: 6, 6: 6,
-    7: 9, 8: 9, 9: 9, 10: 12, 11: 12, 12: 12,
-}
-#PREDICTION_PERIODS = 4  # 1年先まで予測
-WACC_DEFAULT_COST_OF_EQUITY = 0.10  # 株主資本コスト10%
-WACC_DEFAULT_TAX_RATE = 0.25  # 法人税率25%
-
-# ロガーの初期化
+# 既存の資産を使用してロガーを取得
 logger = get_logger(__name__)
 
 
@@ -56,67 +32,33 @@ class BayesianDataProcessor:
     ベイジアンモデリング用データ前処理クラス
     
     FactSetのセグメントデータ、連結データ、製品シェアデータを
-    Stanモデリング用の形式に変換する。データの取得、前処理、
-    統合、Stan用データ構造の生成まで一貫して処理する。
-    
-    Attributes:
-        label_encoder (LabelEncoder): エンティティIDのエンコーディング用
-        quarter_mapping (Dict[int, int]): 月から四半期へのマッピング
-        mapping_df_path (str): マッピングデータファイルのパス
-        
-    Examples:
-        >>> processor = BayesianDataProcessor()
-        >>> data_manager = FactSetDataManager()
-        >>> result = processor.process_full_pipeline(
-        ...     data_manager=data_manager,
-        ...     start_period=201909,
-        ...     end_period=202406
-        ... )
-        >>> print(f"処理完了: {result['processing_info']}")
+    Stanモデリング用の形式に変換する
     """
     
-    def __init__(self, mapping_df_path: Optional[str] = None) -> None:
+    def __init__(self, mapping_df_path: Optional[str] = None):
         """
         初期化
         
         Args:
             mapping_df_path: マッピングデータファイルのパス（オプション）
-                Noneの場合はデフォルトパスを使用
-                
-        Note:
-            マッピングファイルは製品分類の再ラベリングに使用される
         """
-        self.label_encoder = LabelEncoder()
-        self.quarter_mapping = QUARTER_MAPPING.copy()
-        self.mapping_df_path = mapping_df_path or DEFAULT_MAPPING_PATH
+        self.le = LabelEncoder()
+        self.month_map = {
+            1: 3, 2: 3, 3: 3, 4: 6, 5: 6, 6: 6,
+            7: 9, 8: 9, 9: 9, 10: 12, 11: 12, 12: 12,
+        }
+        self.mapping_df_path = mapping_df_path or \
+            "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202501/mapping_df.pkl"
         
     def load_from_data_manager(self, data_manager: FactSetDataManager) -> Dict[str, pd.DataFrame]:
         """
         FactSetDataManagerからデータを取得してBayesianDataProcessor用に変換
         
-        FactSetDataManagerから基本データを取得し、製品スコア計算、
-        ROIC/WACC計算、データ統合を行ってBayesian処理用のデータ構造を作成する。
-        
         Args:
-            data_manager (FactSetDataManager): 初期化済みのFactSetDataManager
+            data_manager: 初期化済みのFactSetDataManager
                 
         Returns:
-            Dict[str, pd.DataFrame]: Bayesian処理用のデータ辞書。以下のキーを含む:
-                - segment: セグメントデータ（ROIC、財務指標）
-                - consol: 連結データ（ROIC、WACC、財務指標）
-                - segment_product_share: セグメント製品シェアデータ
-                - consol_product_share: 連結製品シェアデータ
-                - product_names: 製品名リスト
-                
-        Raises:
-            FileNotFoundError: マッピングファイルが見つからない場合
-            KeyError: 必要なデータが存在しない場合
-            
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> data_manager = FactSetDataManager()
-            >>> data = processor.load_from_data_manager(data_manager)
-            >>> print(f"セグメントデータ: {len(data['segment'])} 件")
+            Bayesian処理用のデータ辞書
         """
         logger.info("FactSetDataManagerからデータを取得中...")
         
@@ -153,9 +95,6 @@ class BayesianDataProcessor:
         
         # WACC計算（連結のみ）
         logger.info("WACC計算を実行中...")
-        logger.info(f"財務データ件数: {len(initial_data['financial'])} 件")
-        logger.info(f"エンティティデータ件数: {len(initial_data['entity'])} 件")
-        
         wacc_config = WACCColumnConfig()
         wacc_calculator = WACCCalculator(config=wacc_config)
         
@@ -170,8 +109,9 @@ class BayesianDataProcessor:
         
         logger.info(f"国別リスクパラメータを設定: {len(country_params)} か国")
         # 主要国のパラメータ表示
+        major_countries = ['US', 'JP', 'CN', 'DE', 'GB', 'FR', 'IT', 'CA', 'AU', 'BR', 'IN', 'KR']
         logger.info("主要国のリスクパラメータ:")
-        for code in MAJOR_COUNTRIES:
+        for code in major_countries:
             if risk_manager.is_available(code):
                 params = risk_manager.get_country_params(code)
                 country_name = get_country_name(code)
@@ -186,25 +126,15 @@ class BayesianDataProcessor:
         )
         
         # WACC計算結果を取得
-        logger.info(f"WACC計算開始: {len(wacc_financial_data)} 件のデータを処理中...")
-        
-        try:
-            wacc_results = wacc_calculator.calculate_wacc_from_merged_data(
-                wacc_financial_data,
-                cost_of_equity=WACC_DEFAULT_COST_OF_EQUITY,
-                tax_rate=WACC_DEFAULT_TAX_RATE
-            )
-            logger.info("WACC計算が正常に完了しました")
-            logger.debug(f"WACC計算結果のキー: {list(wacc_results.keys())}")
-        except Exception as e:
-            logger.error(f"WACC計算中にエラーが発生: {e}")
-            wacc_results = {'processed_data': pd.DataFrame()}
+        wacc_results = wacc_calculator.calculate_wacc_from_merged_data(
+            wacc_financial_data,
+            cost_of_equity=0.10,  # 株主資本コスト10%（例）
+            tax_rate=0.25         # 法人税率25%（例）
+        )
+        logger.debug(wacc_results)
         
         # WACC結果から連結データを抽出
         if 'processed_data' in wacc_results and 'WACC' in wacc_results['processed_data'].columns:
-            logger.info(f"WACC計算結果を処理中: {len(wacc_results['processed_data'])} 件")
-            
-            # メモリ効率を考慮した列選択
             wacc_calculation_cols = [
                 'FACTSET_ENTITY_ID', 'FTERM_2', 'FISCAL_YEAR', 'WACC',
                 '時価総額', '平均有利子負債', '企業価値',
@@ -212,28 +142,9 @@ class BayesianDataProcessor:
                 '負債コスト(税引前)', '実効税率'
             ]
             
-            # 利用可能な列のみを選択
-            available_cols = [col for col in wacc_calculation_cols if col in wacc_results['processed_data'].columns]
-            
-            # データ型を最適化してメモリ使用量を削減
-            wacc_consol_data = wacc_results['processed_data'][available_cols].copy()
-            
-            # データ型の最適化
-            if 'FACTSET_ENTITY_ID' in wacc_consol_data.columns:
-                wacc_consol_data['FACTSET_ENTITY_ID'] = wacc_consol_data['FACTSET_ENTITY_ID'].astype('category')
-            
-            # 数値列の最適化
-            numeric_cols = wacc_consol_data.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                if col != 'FACTSET_ENTITY_ID':
-                    wacc_consol_data[col] = pd.to_numeric(wacc_consol_data[col], errors='coerce')
+            wacc_consol_data = wacc_results['processed_data'][wacc_calculation_cols].copy()
             
             logger.info(f"WACC計算完了: {len(wacc_consol_data)} 件")
-            
-            # メモリ使用量の確認
-            memory_usage = wacc_consol_data.memory_usage(deep=True).sum() / 1024**2  # MB
-            logger.info(f"WACCデータメモリ使用量: {memory_usage:.2f} MB")
-            
         else:
             logger.error("WACC計算でエラーが発生しました")
             wacc_consol_data = pd.DataFrame()
@@ -254,8 +165,8 @@ class BayesianDataProcessor:
         segment_product_share = self._prepare_product_share(pivot_data['segment_l5'])
         consol_product_share = self._prepare_product_share(pivot_data['consol_l5'])
         
-        # 製品名の抽出（重複除去とソート）
-        product_names = sorted(list(set(pivot_data['segment_l5'].columns)))
+        # 製品名の抽出
+        product_names = list(pivot_data['segment_l5'].columns)
         
         result_data = {
             'segment': segment_data,
@@ -277,27 +188,12 @@ class BayesianDataProcessor:
         """
         マッピングデータをファイルから読み込み
         
-        製品分類の再ラベリング用のマッピングデータをpickleファイルから読み込む。
-        必要な列（FACTSET_ENTITY_ID, PRODUCT_L6_ID, RELABEL_L6_ID）のみを抽出する。
-        
         Args:
-            segment_mapping (pd.DataFrame): セグメントマッピングデータ（未使用）
-            rbics_master (pd.DataFrame): RBICS マスターデータ（未使用）
+            segment_mapping: セグメントマッピングデータ
+            rbics_master: RBICS マスターデータ
             
         Returns:
-            pd.DataFrame: マッピングデータ。以下の列を含む:
-                - FACTSET_ENTITY_ID: エンティティID
-                - PRODUCT_L6_ID: 製品L6 ID
-                - RELABEL_L6_ID: 再ラベルL6 ID
-                
-        Raises:
-            FileNotFoundError: マッピングファイルが見つからない場合
-            KeyError: 必要な列が存在しない場合
-            
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> mapping_df = processor._load_mapping_df(segment_mapping, rbics_master)
-            >>> print(f"マッピングデータ: {len(mapping_df)} 件")
+            マッピングデータ
         """
         # ファイルからマッピングデータを読み込み
         if not os.path.exists(self.mapping_df_path):
@@ -313,31 +209,7 @@ class BayesianDataProcessor:
     
     def _prepare_segment_data(self, segment_scores: pd.DataFrame, 
                             segment_roic: pd.DataFrame) -> pd.DataFrame:
-        """
-        セグメントデータをBayesian用に変換
-        
-        セグメントスコアデータとROICデータを統合し、
-        Bayesianモデリング用のセグメントデータを作成する。
-        
-        Args:
-            segment_scores (pd.DataFrame): セグメントスコアデータ
-            segment_roic (pd.DataFrame): セグメントROICデータ（ピボット形式）
-            
-        Returns:
-            pd.DataFrame: 統合されたセグメントデータ。以下の列を含む:
-                - FACTSET_ENTITY_ID: エンティティID
-                - LABEL: ラベル
-                - FTERM_2: 期間
-                - CODE_SEGMENT_ADJ: セグメントコード
-                - SEG_営業利益(税引後): セグメント営業利益
-                - SEG_投下資本(運用ベース): セグメント投下資本
-                - SEG_ROIC(運用ベース): セグメントROIC
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> segment_data = processor._prepare_segment_data(scores, roic)
-            >>> print(f"セグメントデータ: {len(segment_data)} 件")
-        """
+        """セグメントデータをBayesian用に変換"""
         # セグメントROICをlong形式に変換
         segment_roic_long = segment_roic.stack().to_frame("SEG_ROIC(運用ベース)").reset_index()
         segment_roic_long.rename(columns={'level_0': 'CODE_SEGMENT_ADJ'}, inplace=True)
@@ -361,34 +233,8 @@ class BayesianDataProcessor:
     
     def _prepare_consol_data(self, financial_data: pd.DataFrame, 
                            consol_roic: pd.DataFrame,
-                           wacc_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        連結データをBayesian用に変換（ROICとWACCを統合）
-        
-        財務データ、ROICデータ、WACCデータを統合し、
-        Bayesianモデリング用の連結データを作成する。
-        
-        Args:
-            financial_data (pd.DataFrame): 財務データ
-            consol_roic (pd.DataFrame): 連結ROICデータ（ピボット形式）
-            wacc_data (Optional[pd.DataFrame]): WACCデータ（オプション）
-            
-        Returns:
-            pd.DataFrame: 統合された連結データ。以下の列を含む:
-                - FACTSET_ENTITY_ID: エンティティID
-                - FTERM_2: 期間
-                - FISCAL_YEAR: 会計年度
-                - 営業利益(税引後): 営業利益
-                - 投下資本(運用ベース): 投下資本
-                - ROIC(運用ベース): ROIC
-                - WACC: WACC（利用可能な場合）
-                - その他WACC計算詳細列（利用可能な場合）
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> consol_data = processor._prepare_consol_data(financial, roic, wacc)
-            >>> print(f"連結データ: {len(consol_data)} 件")
-        """
+                           wacc_data: pd.DataFrame = None) -> pd.DataFrame:
+        """連結データをBayesian用に変換（ROICとWACCを統合）"""
         # 連結ROICをlong形式に変換
         consol_roic_long = consol_roic.stack().to_frame("ROIC(運用ベース)").reset_index()
         
@@ -409,57 +255,13 @@ class BayesianDataProcessor:
         
         # WACCデータも追加（ある場合）
         if wacc_data is not None and not wacc_data.empty:
-            logger.info(f"WACCデータ統合開始: ROICデータ {len(result)} 件, WACCデータ {len(wacc_data)} 件")
-            
-            # メモリ効率を考慮したマージ処理
-            try:
-                # 必要な列のみを選択してメモリ使用量を削減
-                wacc_essential_cols = ['FACTSET_ENTITY_ID', 'FTERM_2', 'WACC']
-                wacc_subset = wacc_data[wacc_essential_cols].copy()
-                
-                # データ型を最適化
-                wacc_subset['FACTSET_ENTITY_ID'] = wacc_subset['FACTSET_ENTITY_ID'].astype('category')
-                result['FACTSET_ENTITY_ID'] = result['FACTSET_ENTITY_ID'].astype('category')
-                
-                # 段階的なマージ処理
-                logger.info("WACCデータのマージ処理を実行中...")
-                
-                # 大量データの場合は分割処理
-                if len(result) > 100000:
-                    logger.info("大量データのため分割処理を実行します")
-                    chunk_size = 50000
-                    merged_chunks = []
-                    
-                    for i in range(0, len(result), chunk_size):
-                        chunk = result.iloc[i:i+chunk_size].copy()
-                        merged_chunk = chunk.merge(
-                            wacc_subset,
-                            on=['FACTSET_ENTITY_ID', 'FTERM_2'],
-                            how='left'
-                        )
-                        merged_chunks.append(merged_chunk)
-                        logger.info(f"チャンク {i//chunk_size + 1}/{(len(result)-1)//chunk_size + 1} 完了")
-                    
-                    result = pd.concat(merged_chunks, ignore_index=True)
-                    del merged_chunks
-                else:
-                    result = result.merge(
-                        wacc_subset,
-                        on=['FACTSET_ENTITY_ID', 'FTERM_2'],
-                        how='left'
-                    )
-                
-                # メモリクリーンアップ
-                del wacc_subset
-                
-                logger.info(f"WACCデータを連結データに統合完了: {result['WACC'].notna().sum()} 件")
-                
-            except MemoryError:
-                logger.error("メモリ不足のため、WACCデータの統合をスキップします")
-                result['WACC'] = np.nan
-            except Exception as e:
-                logger.error(f"WACCデータ統合中にエラーが発生: {e}")
-                result['WACC'] = np.nan
+            # WACCデータとマージ
+            result = result.merge(
+                wacc_data,  # 全ての計算詳細列を含める
+                on=['FACTSET_ENTITY_ID', 'FTERM_2'],
+                how='left'  # ROICに合わせてleft join
+            )
+            logger.info(f"WACCデータを連結データに統合: {result['WACC'].notna().sum()} 件")
         else:
             # WACCデータがない場合はNaNで埋める
             result['WACC'] = np.nan
@@ -468,24 +270,7 @@ class BayesianDataProcessor:
         return result
     
     def _prepare_product_share(self, pivot_data: pd.DataFrame) -> pd.DataFrame:
-        """
-        製品シェアデータを準備（セグメント・連結共通）
-        
-        ピボット形式の製品シェアデータを平坦化し、
-        FTERM_2列を適切な形式に変換する。
-        
-        Args:
-            pivot_data (pd.DataFrame): ピボット形式の製品シェアデータ
-            
-        Returns:
-            pd.DataFrame: 平坦化された製品シェアデータ。
-                FTERM_2列がYYYYMM形式の整数に変換される。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> share_data = processor._prepare_product_share(pivot_df)
-            >>> print(f"製品シェアデータ: {len(share_data)} 件")
-        """
+        """製品シェアデータを準備（セグメント・連結共通）"""
         # MultiIndexを平坦化
         result = pivot_data.reset_index()
         
@@ -514,24 +299,13 @@ class BayesianDataProcessor:
         """
         期間でデータをフィルタリング
         
-        指定された期間（YYYYMM形式）に基づいて、
-        セグメントデータ、連結データ、製品シェアデータをフィルタリングする。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
-            start_period (int): 開始期間（YYYYMM形式、例：201909）
-            end_period (int): 終了期間（YYYYMM形式、例：202406）
+            data: データ辞書
+            start_period: 開始期間（YYYYMM形式）
+            end_period: 終了期間（YYYYMM形式）
             
         Returns:
-            Dict[str, pd.DataFrame]: フィルタリングされたデータ辞書。
-                元のデータ辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> filtered_data = processor.filter_data_by_period(
-            ...     data, start_period=201909, end_period=202406
-            ... )
-            >>> print(f"フィルタリング後: {len(filtered_data['consol'])} 件")
+            フィルタリングされたデータ辞書
         """
         filtered_data = {}
         
@@ -560,25 +334,12 @@ class BayesianDataProcessor:
         """
         有効なエンティティでデータをフィルタリング
         
-        欠損値の割合が閾値未満のエンティティのみを残す。
-        セグメントデータと連結データの両方に対して適用される。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
-            na_threshold (float): 欠損値の閾値（0.0-1.0）。
-                1.0未満で欠損率フィルタリングを実行。
-                デフォルトは1.0（フィルタリングなし）。
+            data: データ辞書
+            na_threshold: 欠損値の閾値（1.0未満で欠損率フィルタリング）
             
         Returns:
-            Dict[str, pd.DataFrame]: フィルタリングされたデータ辞書。
-                元のデータ辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> filtered_data = processor.filter_valid_entities(
-            ...     data, na_threshold=0.5
-            ... )
-            >>> print(f"有効エンティティ: {len(filtered_data['consol'])} 件")
+            フィルタリングされたデータ辞書
         """
         filtered_data = data.copy()
         
@@ -606,21 +367,11 @@ class BayesianDataProcessor:
         """
         データ間でエンティティIDを整合させる
         
-        セグメントデータ、連結データ、製品シェアデータ間で
-        エンティティIDの整合性を確保する。全てのデータセットに
-        共通して存在するエンティティのみを残す。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
+            data: データ辞書
             
         Returns:
-            Dict[str, pd.DataFrame]: 整合されたデータ辞書。
-                元のデータ辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> aligned_data = processor.align_data_entities(data)
-            >>> print(f"整合後: {len(aligned_data['consol'])} 件")
+            整合されたデータ辞書
         """
         aligned_data = data.copy()
         
@@ -648,21 +399,11 @@ class BayesianDataProcessor:
         """
         製品名をクリーニング（シェアが0の製品を除去）
         
-        セグメント製品シェアデータと連結製品シェアデータから、
-        全ての期間でシェアが0の製品を特定し、除去する。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
+            data: データ辞書
             
         Returns:
-            Tuple[Dict[str, pd.DataFrame], List[str]]: 
-                - クリーニングされたデータ辞書
-                - 有効な製品名リスト
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> cleaned_data, valid_products = processor.clean_product_names(data)
-            >>> print(f"有効製品数: {len(valid_products)}")
+            クリーニングされたデータ辞書と有効な製品名リスト
         """
         prod_names = data['product_names'].copy()
         cleaned_data = data.copy()
@@ -693,20 +434,11 @@ class BayesianDataProcessor:
         """
         日付フォーマットを変換
         
-        FTERM_2列をYYYYMM形式の整数からpandasのdatetime型に変換する。
-        セグメントデータ、連結データ、製品シェアデータの全てに適用される。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
+            data: データ辞書
             
         Returns:
-            Dict[str, pd.DataFrame]: 日付変換されたデータ辞書。
-                元のデータ辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> converted_data = processor.convert_date_format(data)
-            >>> print(f"変換後: {converted_data['consol']['FTERM_2'].dtype}")
+            日付変換されたデータ辞書
         """
         converted_data = {}
         
@@ -739,20 +471,11 @@ class BayesianDataProcessor:
         """
         セグメント情報からマッピングデータを作成
         
-        CODE_SEGMENT_ADJ列から正規表現を使用して
-        FACTSET_ENTITY_IDとSEGMENT_ADJを抽出する。
-        
         Args:
-            segment_data (pd.DataFrame): セグメントデータ
+            segment_data: セグメントデータ
             
         Returns:
-            pd.DataFrame: マッピングされたセグメントデータ。
-                元のデータにFACTSET_ENTITY_IDとSEGMENT_ADJ列が追加される。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> mapped_data = processor.create_segment_mapping(segment_df)
-            >>> print(f"マッピング後: {mapped_data.columns.tolist()}")
+            マッピングされたセグメントデータ
         """
         segment_mapped = segment_data.reset_index(drop=True)
         segment_mapped[["FACTSET_ENTITY_ID", "SEGMENT_ADJ"]] = segment_mapped["CODE_SEGMENT_ADJ"].str.extract(r"(.+?)_(.+)")
@@ -762,20 +485,11 @@ class BayesianDataProcessor:
         """
         製品シェアデータとメインデータをマージ
         
-        セグメントデータと連結データのそれぞれについて、
-        製品シェアデータとメインデータをマージする。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
+            data: データ辞書
             
         Returns:
-            Dict[str, pd.DataFrame]: マージされたデータ辞書。
-                元のデータ辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> merged_data = processor.merge_product_share_data(data)
-            >>> print(f"マージ後: {len(merged_data['segment_product_share'])} 件")
+            マージされたデータ辞書
         """
         merged_data = data.copy()
         
@@ -798,25 +512,12 @@ class BayesianDataProcessor:
         """
         ピボットテーブルを作成
         
-        セグメントROIC、連結ROIC、WACC、製品シェアデータから
-        ピボットテーブルを作成する。時系列補完も実行される。
-        
         Args:
-            data (Dict[str, pd.DataFrame]): データ辞書
-            prod_names (List[str]): 製品名リスト
+            data: データ辞書
+            prod_names: 製品名リスト
             
         Returns:
-            Dict[str, pd.DataFrame]: ピボットテーブル辞書。以下のキーを含む:
-                - Y_segment: セグメントROICピボットテーブル
-                - Y_consol: 連結ROICピボットテーブル
-                - Y_consol_wacc: WACCピボットテーブル（利用可能な場合）
-                - X2_segment: セグメント製品シェアピボットテーブル
-                - X2_consol: 連結製品シェアピボットテーブル
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> pivot_tables = processor.create_pivot_tables(data, product_names)
-            >>> print(f"ピボットテーブル数: {len(pivot_tables)}")
+            ピボットテーブル辞書
         """
         pivot_tables = {}
         
@@ -861,7 +562,7 @@ class BayesianDataProcessor:
             .set_index(["CODE_SEGMENT_ADJ", "FTERM_2"])
         )
         
-        # 時系列補完（セグメント）
+        # 時系列補完
         pivot_tables['X2_segment'].loc[:, prod_names] = (
             pivot_tables['X2_segment']
             .groupby(by=["CODE_SEGMENT_ADJ"], group_keys=False)
@@ -878,7 +579,7 @@ class BayesianDataProcessor:
             .set_index(["FACTSET_ENTITY_ID", "FTERM_2"])
         )
         
-        # 時系列補完（連結）
+        # 時系列補完
         pivot_tables['X2_consol'].loc[:, prod_names] = (
             pivot_tables['X2_consol']
             .groupby(by=["FACTSET_ENTITY_ID"], group_keys=False)
@@ -887,14 +588,16 @@ class BayesianDataProcessor:
         )
         pivot_tables['X2_consol'].sort_index(inplace=True)
         
-        # データ整合処理（元のnotebookと完全に同様の処理）
+        # 元のnotebookと完全に同様の処理
         
-        # セグメント側の処理：X2_segment に存在する月だけを Y_segment の列として残す
+        # セグメント側の処理
+        # X2_segment に存在する月だけを Y_segment の列として残す
         first_segment_date = pivot_tables['X2_segment'].index.get_level_values(1).unique()[0]
         segment_entities_in_first_date = pivot_tables['X2_segment'].xs(first_segment_date, level=1).index
         pivot_tables['Y_segment'] = pivot_tables['Y_segment'].loc[segment_entities_in_first_date]
         
-        # 連結側の処理：X2_consol に存在する月だけを Y_consol の列として残す  
+        # 連結側の処理
+        # X2_consol に存在する月だけを Y_consol の列として残す  
         first_consol_date = pivot_tables['X2_consol'].index.get_level_values(1).unique()[0]
         consol_entities_in_first_date = pivot_tables['X2_consol'].xs(first_consol_date, level=1).index
         logger.info(f"連結データ整合前: {len(pivot_tables['Y_consol'])} エンティティ")
@@ -908,21 +611,11 @@ class BayesianDataProcessor:
         """
         ピボットテーブル間でインデックスを整合させる（np.stackエラー対策）
         
-        全ての時点で共通するエンティティのみを残すことで、
-        ピボットテーブル間の整合性を確保する。
-        Stan用データ構造作成時のnp.stackエラーを防ぐ。
-        
         Args:
-            pivot_tables (Dict[str, pd.DataFrame]): ピボットテーブル辞書
+            pivot_tables: ピボットテーブル辞書
             
         Returns:
-            Dict[str, pd.DataFrame]: 整合されたピボットテーブル辞書。
-                元のピボットテーブル辞書と同じ構造を持つ。
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> aligned_tables = processor.align_pivot_tables(pivot_tables)
-            >>> print(f"整合後: {aligned_tables['Y_consol'].shape}")
+            整合されたピボットテーブル辞書
         """
         aligned_tables = pivot_tables.copy()
         
@@ -943,11 +636,6 @@ class BayesianDataProcessor:
                 common_segments = date_segments
             else:
                 common_segments = common_segments.intersection(date_segments)
-                
-            # 早期終了：共通セグメントが空になった場合
-            if not common_segments:
-                logger.warning("共通セグメントが存在しません")
-                break
         
         logger.info(f"共通セグメント数: {len(common_segments)}")
         
@@ -976,11 +664,6 @@ class BayesianDataProcessor:
                 common_entities = date_entities
             else:
                 common_entities = common_entities.intersection(date_entities)
-                
-            # 早期終了：共通エンティティが空になった場合
-            if not common_entities:
-                logger.warning("共通エンティティが存在しません")
-                break
         
         logger.info(f"全時点共通エンティティ数: {len(common_entities)}")
         
@@ -1018,38 +701,23 @@ class BayesianDataProcessor:
         return aligned_tables
     
     def create_stan_data_structure(self, pivot_tables: Dict[str, pd.DataFrame], 
-                                 prod_names: List[str]) -> Dict[str, Union[int, np.ndarray]]:
+                                 prod_names: List[str]) -> Dict:
         """
         Stan用のデータ構造を作成
         
-        ピボットテーブルからStanモデリング用のデータ構造を作成する。
-        次元数、観測値、インデックス、シェアマトリックスなどを含む。
-        
         Args:
-            pivot_tables (Dict[str, pd.DataFrame]): ピボットテーブル辞書
-            prod_names (List[str]): 製品名リスト
+            pivot_tables: ピボットテーブル辞書
+            prod_names: 製品名リスト
             
         Returns:
-            Dict[str, Union[int, np.ndarray]]: Stan用データ辞書。以下のキーを含む:
-                - Segment_N, Time_N, Product_N, Company_N_c: 次元数
-                - Share, Share_consol: シェアマトリックス
-                - Seg_ROIC, Consol_ROIC, Consol_WACC: 観測値
-                - segment_index, consol_index, wacc_index: エンティティインデックス
-                - non_na_index, non_na_index_consol, non_na_index_wacc: 非欠損値インデックス
-                - N_obs, N_obs_consol, N_obs_wacc: 観測値数
-                - N_pred_term: 予測期間数
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> stan_data = processor.create_stan_data_structure(pivot_tables, products)
-            >>> print(f"Stanデータ次元: {stan_data['Company_N_c']} 企業")
+            Stan用データ辞書
         """
         stan_data = {}
         
         # 基本次元数
         stan_data["Segment_N"], stan_data["Time_N"] = pivot_tables['Y_segment'].shape
         stan_data["Product_N"] = len(prod_names)
-#        stan_data["Company_N"] = len(pivot_tables['Y_consol'].index)
+        stan_data["Company_N"] = len(pivot_tables['Y_consol'].index)
         stan_data["Company_N_c"] = pivot_tables['Y_consol'].shape[0]
         
         # シェアマトリックス（時間×エンティティ×製品）
@@ -1067,92 +735,83 @@ class BayesianDataProcessor:
         stan_data["Share_consol"] = shared_consol
         stan_data["N_Share_consol_index"] = shared_consol.shape[1]
         
-        # 観測値の処理（欠損値除去）
-        # セグメントROICデータ
+        # 観測値（欠損値除去）
         y_segment_flat = pivot_tables['Y_segment'].to_numpy().ravel(order='F')
-        segment_valid_mask = ~np.isnan(y_segment_flat)
-        stan_data["Seg_ROIC"] = y_segment_flat[segment_valid_mask]
-        stan_data["non_na_index"] = np.argwhere(segment_valid_mask).ravel(order='F') + 1
+        nonna_segment = np.argwhere(~np.isnan(y_segment_flat)).ravel(order='F') + 1
+        
+        stan_data["Seg_ROIC"] = y_segment_flat[~np.isnan(y_segment_flat)]
+        stan_data["non_na_index"] = nonna_segment
         stan_data["N_obs"] = len(stan_data["Seg_ROIC"]) 
         
-        # 連結ROICデータ
         y_consol_flat = pivot_tables['Y_consol'].to_numpy().ravel(order='F')
-        consol_valid_mask = ~np.isnan(y_consol_flat)
-        stan_data["Consol_ROIC"] = y_consol_flat[consol_valid_mask]
-        stan_data["non_na_index_consol"] = np.argwhere(consol_valid_mask).ravel(order='F') + 1
+        nonna_consol = np.argwhere(~np.isnan(y_consol_flat)).ravel(order='F') + 1
+        
+        stan_data["Consol_ROIC"] = y_consol_flat[~np.isnan(y_consol_flat)]
+        stan_data["non_na_index_consol"] = nonna_consol
         stan_data["N_obs_consol"] = len(stan_data["Consol_ROIC"]) 
         
         # WACCデータの処理（存在する場合）
         if 'Y_consol_wacc' in pivot_tables:
             y_wacc_flat = pivot_tables['Y_consol_wacc'].to_numpy().ravel(order='F')
-            wacc_valid_mask = ~np.isnan(y_wacc_flat)
+            nonna_wacc = np.argwhere(~np.isnan(y_wacc_flat)).ravel(order='F') + 1
             
-            stan_data["Consol_WACC"] = y_wacc_flat[wacc_valid_mask]
-            stan_data["non_na_index_wacc"] = np.argwhere(wacc_valid_mask).ravel(order='F') + 1
+            stan_data["Consol_WACC"] = y_wacc_flat[~np.isnan(y_wacc_flat)]
+            stan_data["non_na_index_wacc"] = nonna_wacc
             stan_data["N_obs_wacc"] = len(stan_data["Consol_WACC"]) 
             
             # WACCエンティティインデックス（ROICと同じ構造）
             wacc_codes = pivot_tables['Y_consol_wacc'].index.values
-            self.label_encoder.fit(wacc_codes)
+            self.le.fit(wacc_codes)
             codes_cat_wacc = np.repeat(
-                self.label_encoder.transform(wacc_codes).astype("int32").reshape(-1, 1),
+                self.le.transform(wacc_codes).astype("int32").reshape(-1, 1),
                 pivot_tables['Y_consol_wacc'].shape[1],
                 axis=1,
             )
-            stan_data["wacc_index"] = codes_cat_wacc.ravel(order="F")[wacc_valid_mask] + 1
+            stan_data["wacc_index"] = codes_cat_wacc.ravel(order="F")[~np.isnan(y_wacc_flat)] + 1
             logger.info(f"WACC Stan データ作成: {stan_data['N_obs_wacc']} 観測値")
         else:
-            # WACCデータがない場合のデフォルト値
+            # WACCデータがない場合
             stan_data["Consol_WACC"] = np.array([])
             stan_data["non_na_index_wacc"] = np.array([])
             stan_data["N_obs_wacc"] = 0
             stan_data["wacc_index"] = np.array([])
             logger.warning("WACC データが利用できません")
         
-        # エンティティインデックスの作成
-        # セグメントインデックス
+        # エンティティインデックス
         segment_codes = pivot_tables['Y_segment'].index.values
-        self.label_encoder.fit(segment_codes)
+        self.le.fit(segment_codes)
         codes_cat = np.repeat(
-            self.label_encoder.transform(segment_codes).astype("int32").reshape(-1, 1),
+            self.le.transform(segment_codes).astype("int32").reshape(-1, 1),
             pivot_tables['Y_segment'].shape[1],
             axis=1,
         )
-        stan_data["segment_index"] = codes_cat.ravel(order="F")[segment_valid_mask] + 1
+        stan_data["segment_index"] = codes_cat.ravel(order="F")[~np.isnan(y_segment_flat)] + 1
         stan_data["segment_index_vec"] = codes_cat[:, 0] + 1
         stan_data["N_segment_index_vec"] = len(stan_data["segment_index_vec"])
         
-        # 連結インデックス
         consol_codes = pivot_tables['Y_consol'].index.values
-        self.label_encoder.fit(consol_codes)
+        self.le.fit(consol_codes)
         codes_cat_consol = np.repeat(
-            self.label_encoder.transform(consol_codes).astype("int32").reshape(-1, 1),
+            self.le.transform(consol_codes).astype("int32").reshape(-1, 1),
             pivot_tables['Y_consol'].shape[1],
             axis=1,
         )
-        stan_data["consol_index"] = codes_cat_consol.ravel(order="F")[consol_valid_mask] + 1
+        stan_data["consol_index"] = codes_cat_consol.ravel(order="F")[~np.isnan(y_consol_flat)] + 1
         stan_data["consol_index_vec"] = codes_cat_consol[:, 0] + 1
         stan_data["N_consol_index_vec"] = len(stan_data["consol_index_vec"])
         
         # 予測期間
-        #stan_data["N_pred_term"] = PREDICTION_PERIODS
+        stan_data["N_pred_term"] = 4  # 1年先まで予測
         
         return stan_data
     
-    def save_processed_data(self, processed_data: Dict[str, Any], save_path: str) -> None:
+    def save_processed_data(self, processed_data: Dict, save_path: str):
         """
         処理済みデータを保存
         
-        処理済みデータをpickle形式で指定されたパスに保存する。
-        保存先ディレクトリが存在しない場合は自動作成する。
-        
         Args:
-            processed_data (Dict[str, Any]): 処理済みデータ辞書
-            save_path (str): 保存先パス
-            
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> processor.save_processed_data(data, "/path/to/output.pkl")
+            processed_data: 処理済みデータ辞書
+            save_path: 保存先パス
         """
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1165,39 +824,18 @@ class BayesianDataProcessor:
     def process_full_pipeline(self, data_manager: FactSetDataManager,
                             start_period: int,
                             end_period: int,
-                            save_path: Optional[str] = None) -> Dict[str, Any]:
+                            save_path: Optional[str] = None) -> Dict:
         """
         ベイジアンモデリング用データ前処理の全パイプラインを実行
         
-        データ取得からStan用データ構造作成まで、
-        ベイジアンモデリング用のデータ前処理を一貫して実行する。
-        各ステップでモニタリングとログ出力を行う。
-        
         Args:
-            data_manager (FactSetDataManager): 初期化済みのFactSetDataManager
-            start_period (int): 開始期間（YYYYMM形式、例：201909）
-            end_period (int): 終了期間（YYYYMM形式、例：202406）
-            save_path (Optional[str]): 保存先パス（Noneの場合は保存しない）
+            data_manager: 初期化済みのFactSetDataManager
+            save_path: 保存先パス（Noneの場合は保存しない）
+            start_period: 開始期間
+            end_period: 終了期間
             
         Returns:
-            Dict[str, Any]: 処理済みデータ辞書。以下のキーを含む:
-                - raw_data: 生データ（セグメント、連結、製品シェアデータ）
-                - pivot_tables: ピボットテーブル辞書
-                - stan_data: Stan用データ構造
-                - product_names: 製品名リスト
-                - entity_info: エンティティ情報
-                - processing_info: 処理情報（期間、件数など）
-                
-        Examples:
-            >>> processor = BayesianDataProcessor()
-            >>> data_manager = FactSetDataManager()
-            >>> result = processor.process_full_pipeline(
-            ...     data_manager=data_manager,
-            ...     start_period=201909,
-            ...     end_period=202406,
-            ...     save_path="/path/to/output.pkl"
-            ... )
-            >>> print(f"処理完了: {result['processing_info']}")
+            処理済みデータ辞書
         """
         logger.info("=== ベイジアンモデリング用データ前処理開始 ===")
         
@@ -1206,11 +844,6 @@ class BayesianDataProcessor:
             logger.info("1. FactSetDataManagerからデータ取得中...")
             data = self.load_from_data_manager(data_manager)
             monitor.set_final_data(data['consol'], entity_id_col="FACTSET_ENTITY_ID")
-            
-            # メモリ使用量の確認
-            import psutil
-            memory_info = psutil.virtual_memory()
-            logger.info(f"メモリ使用状況: {memory_info.percent:.1f}% 使用中 ({memory_info.available / 1024**3:.1f} GB 利用可能)")
         
         # 2. Entity情報の準備（国別可視化用）
         with monitor_data_processing("Entity情報準備", logger) as monitor:

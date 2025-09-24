@@ -24,29 +24,15 @@
         dataset: "dataset.pkl"
     optional_data:
       mapping_file: "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202501/mapping_df.pkl"
-
-Attributes:
-    DEFAULT_MAPPING_PATH (str): デフォルトのマッピングファイルパス
-    
-Examples:
-    >>> # CLIから実行
-    >>> python -m gppm.cli.prepare_data
-    
-    >>> # プログラムから実行
-    >>> from gppm.cli.prepare_data import main
-    >>> processed_data = main()
-    >>> print(f"処理済みエンティティ数: {len(processed_data['raw_data']['consol'])}")
 """
 
 from pathlib import Path
-from typing import Dict, Any, Optional
-
 from gppm.analysis.bayesian.data_processor import BayesianDataProcessor
 from gppm.core.data_manager import FactSetDataManager
 from gppm.core.config_manager import ConfigManager
 
 
-def main() -> Dict[str, Any]:
+def main():
     """
     ベイジアンデータ処理のメイン関数
     
@@ -54,18 +40,11 @@ def main() -> Dict[str, Any]:
     データ前処理パイプラインを実行します。
     
     Returns:
-        Dict[str, Any]: 処理済みデータ辞書。以下のキーを含む:
-            - raw_data: 生データ（セグメント、連結、製品シェアデータ）
-            - pivot_tables: ピボットテーブル辞書
-            - stan_data: Stan用データ構造
-            - product_names: 製品名リスト
-            - entity_info: エンティティ情報
-            - processing_info: 処理情報（期間、件数など）
+        処理済みデータ辞書
         
     Raises:
         ValueError: 必須パラメータが設定ファイルに存在しない場合
         FileNotFoundError: 設定ファイルが見つからない場合
-        KeyError: 設定ファイルの構造が期待される形式でない場合
         
     Examples:
         >>> # CLIから実行
@@ -74,50 +53,35 @@ def main() -> Dict[str, Any]:
         >>> # プログラムから実行
         >>> from gppm.cli.prepare_data import main
         >>> processed_data = main()
-        >>> print(f"処理済みエンティティ数: {len(processed_data['raw_data']['consol'])}")
-        >>> print(f"製品数: {processed_data['processing_info']['n_products']}")
+        >>> print(f"処理済みエンティティ数: {len(processed_data['financial_df'])}")
     """
-    # 設定管理の初期化
+    # ConfigManagerを使用して設定を取得
     config_manager = ConfigManager()
     config = config_manager.get_config()
     
-    # 設定の検証と警告表示
+    # 設定の検証
     validation_results = config_manager.validate_config(config)
     if not all(validation_results.values()):
         print(f"設定検証で警告があります: {validation_results}")
     
-    # 出力パスの構築
-    save_path = Path(config.output.directory) / config.output.files.dataset
+    # 保存パスの設定
+    save_path = Path(config.output.directory / config.output.files.dataset)
     
-    # データ処理コンポーネントの初期化
+    # データ処理の実行
     data_manager = FactSetDataManager()
-    mapping_df_path = getattr(config.optional_data, 'mapping_df_path', None)
+    mapping_df_path = config.optinal_data.mapping_df_path
     bayesian_processor = BayesianDataProcessor(mapping_df_path=mapping_df_path)
     
-    # データ処理パイプラインの実行
     processed_data = bayesian_processor.process_full_pipeline(
         data_manager=data_manager,
         start_period=config.analysis_period.start,
         end_period=config.analysis_period.end,
         save_path=str(save_path)
     )
-    
     return processed_data
 
 
 if __name__ == "__main__":
-    """
-    CLIエントリーポイント
-    
-    このスクリプトが直接実行された場合に、
-    ベイジアンデータ処理パイプラインを実行します。
-    """
-    try:
-        result = main()
-        print("データ処理が正常に完了しました。")
-        print(f"処理結果: {result['processing_info']}")
-    except Exception as e:
-        print(f"エラーが発生しました: {e}")
-        raise
+    main()
 
 
