@@ -348,11 +348,11 @@ class TradenameSegmentMapper:
         logger.info(f"商品名データ処理完了: {len(tradename_df)} 件")
 
         # ベクトルストア作成
-        vectorstore = self._create_vectorstore(sector_df, tradename_df)
+        vectorstore_search, vectorstore_searched = self._create_vectorstore(sector_df, tradename_df)
         logger.info("ベクトルストア作成完了")
 
         # マッピング生成
-        mapping_df = self._generate_mappings(vectorstore)
+        mapping_df = self._generate_mappings(vectorstore_search, vectorstore_searched)
         logger.info(f"マッピング生成完了: {len(mapping_df)} 件")
 
         # 結果保存
@@ -634,7 +634,7 @@ class TradenameSegmentMapper:
 
         # ドキュメントローダーの作成
         loader1 = DataFrameLoader(sector_df_processed.dropna(subset=["SEARCHED_TEXT"]), page_content_column="SEARCHED_TEXT")
-        loader2 = DataFrameLoader(tradename_df, page_content_column="SEARCHED_TEXT")
+        loader2 = DataFrameLoader(tradename_df, page_content_column="SEARCH_TEXT")
 
         documents1 = loader1.load()
         documents2 = loader2.load()
@@ -647,27 +647,26 @@ class TradenameSegmentMapper:
         chunks1 = list(split_documents(documents1, self.config.chunk_size))
         chunks2 = list(split_documents(documents2, self.config.chunk_size))
 
-        # ベクトルストアの作成
-        vectorstore = None
-        
-        # セクターデータの処理
+        # セクターデータのベクトルストア作成（検索先）
+        vectorstore_searched = None
         for chunk in chunks1:
-            if vectorstore is None:
-                vectorstore = FAISS.from_documents(chunk, self._embedding_model)
+            if vectorstore_searched is None:
+                vectorstore_searched = FAISS.from_documents(chunk, self._embedding_model)
             else:
                 temp_vectorstore = FAISS.from_documents(chunk, self._embedding_model)
-                vectorstore.merge_from(temp_vectorstore)
+                vectorstore_searched.merge_from(temp_vectorstore)
 
-        # 商品名データの処理
+        # 商品名データのベクトルストア作成（検索元）
+        vectorstore_search = None
         for chunk in chunks2:
-            if vectorstore is None:
-                vectorstore = FAISS.from_documents(chunk, self._embedding_model)
+            if vectorstore_search is None:
+                vectorstore_search = FAISS.from_documents(chunk, self._embedding_model)
             else:
                 temp_vectorstore = FAISS.from_documents(chunk, self._embedding_model)
-                vectorstore.merge_from(temp_vectorstore)
+                vectorstore_search.merge_from(temp_vectorstore)
 
-        logger.info(f"ベクトルストア作成完了: {vectorstore.index.ntotal} 件")
-        return vectorstore
+        logger.info(f"ベクトルストア作成完了: 検索先={vectorstore_searched.index.ntotal}件, 検索元={vectorstore_search.index.ntotal}件")
+        return vectorstore_search, vectorstore_searched
 
     def _remove_illegal_characters(self, value: str) -> str:
         """不正な制御文字を削除。"""
@@ -675,43 +674,44 @@ class TradenameSegmentMapper:
             return re.sub(r'[\x00-\x1F\x7F-\x9F]', '', value)
         return value
 
-    def _generate_mappings(self, vectorstore: FAISS) -> pd.DataFrame:
+    def _generate_mappings(self, vectorstore_search: FAISS, vectorstore_searched: FAISS) -> pd.DataFrame:
         """マッピングの生成。
 
         Args:
-            vectorstore: ベクトルストア
+            vectorstore_search: 検索元ベクトルストア（商品名データ）
+            vectorstore_searched: 検索先ベクトルストア（セクターデータ）
 
         Returns:
             生成されたマッピングDataFrame
         """
         logger.info("マッピング生成開始")
 
-        # クエリ準備
-        doc_id_to_faiss_id = {v: k for k, v in vectorstore.index_to_docstore_id.items()}
-        query_ids = list(vectorstore.docstore._dict.keys())
+        # クエリ準備（検索元ベクトルストアから）
+        doc_id_to_faiss_id = {v: k for k, v in vectorstore_search.index_to_docstore_id.items()}
+        query_ids = list(vectorstore_search.docstore._dict.keys())
 
         queries_embeddings = []
         query_metadata_list = []
 
         for doc_id in query_ids:
             faiss_id = doc_id_to_faiss_id[doc_id]
-            emb = vectorstore.index.reconstruct(faiss_id)
+            emb = vectorstore_search.index.reconstruct(faiss_id)
             queries_embeddings.append(emb)
 
-            doc = vectorstore.docstore.search(doc_id)
+            doc = vectorstore_search.docstore.search(doc_id)
             query_metadata_list.append((doc.metadata["FACTSET_ENTITY_ID"], doc.metadata["L6_ID"]))
 
         queries_embeddings = np.array(queries_embeddings)
 
         # マッピング生成
         mapping = {}
-        faiss_index = vectorstore.index
+        faiss_index = vectorstore_searched.index  # 検索先のインデックスを使用
         N = len(queries_embeddings)
         unmapped_indices = set(range(N))
         k = self.config.initial_k
         increment_factor = self.config.increment_factor
         batch_size = self.config.batch_size
-        max_k = vectorstore.index.ntotal
+        max_k = vectorstore_searched.index.ntotal
 
         while unmapped_indices:
             logger.info(f"検索実行: k={k}, 未マッピング={len(unmapped_indices)}")
@@ -727,9 +727,9 @@ class TradenameSegmentMapper:
                 candidate_idxs = set(indices.flatten())
                 candidate_idxs.discard(-1)
                 
-                candidate_doc_ids = {idx: vectorstore.index_to_docstore_id[idx] for idx in candidate_idxs}
+                candidate_doc_ids = {idx: vectorstore_searched.index_to_docstore_id[idx] for idx in candidate_idxs}
                 candidate_docs = {
-                    doc_id: vectorstore.docstore.search(doc_id)
+                    doc_id: vectorstore_searched.docstore.search(doc_id)
                     for doc_id in candidate_doc_ids.values()
                 }
 
