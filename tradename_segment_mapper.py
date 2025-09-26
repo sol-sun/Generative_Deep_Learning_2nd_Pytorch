@@ -45,6 +45,7 @@ from pydantic import (
     ConfigDict,
     Field,
     field_validator,
+    field_serializer,
     computed_field,
     model_validator,
 )
@@ -379,13 +380,13 @@ class TradenameSegmentMapper:
         
         try:
             # SentenceTransformerモデルの読み込み
-            self._sentence_transformer = SentenceTransformer(self.config.model_path)
+#            self._sentence_transformer = SentenceTransformer(self.config.model_path)
             
-            # HuggingFaceEmbeddingsの設定
+            # HuggingFaceEmbeddingsの設定（最新仕様に合わせて修正）
             self._embedding_model = HuggingFaceEmbeddings(
-                client=self._sentence_transformer,
+                
                 model_name=self.config.model_path,
-                model_kwargs={"model_kwargs": {"torch_dtype": torch.float16}}
+                model_kwargs={"device": "cuda"}
             )
             
             logger.info("埋め込みモデル読み込み完了")
@@ -411,22 +412,34 @@ class TradenameSegmentMapper:
             period=WolfPeriod.from_day(current_date)
         )
 
-        # セグメントデータの取得
-        sector_df = rbics_provider._query_revenue_segment_data(query_params)
-        
-        if sector_df.empty:
-            raise ValueError("セグメントデータが取得できませんでした")
+        try:
+            # セグメントデータの取得
+            sector_df = rbics_provider._query_revenue_segment_data(query_params)
+            
+            if sector_df.empty:
+                raise ValueError("セグメントデータが取得できませんでした")
+
+            # RBICSマスターデータの取得（REVENUE_L6_NAME, REVENUE_DESCR用）
+            rbics_master = rbics_provider._query_structure_data(query_params)
+            
+            if rbics_master.empty:
+                raise ValueError("RBICSマスターデータが取得できませんでした")
+                
+        except Exception as e:
+            logger.error(f"データ取得エラー: {e}")
+            raise
 
         # データの前処理
-        sector_df = self._preprocess_sector_data(sector_df)
+        sector_df = self._preprocess_sector_data(sector_df, rbics_master)
         
         return sector_df
 
-    def _preprocess_sector_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _preprocess_sector_data(self, df: pd.DataFrame, rbics_master: pd.DataFrame) -> pd.DataFrame:
         """セクターデータの前処理。
 
         Args:
             df: 生のセクターデータ
+            rbics_master: RBICSマスターデータ
 
         Returns:
             前処理済みのセクターデータ
@@ -453,6 +466,19 @@ class TradenameSegmentMapper:
 
         # 重複行の削除
         df = df.groupby(["FACTSET_ENTITY_ID", "FISCAL_YEAR"]).apply(self._remove_redundant_rows).reset_index(drop=True)
+
+        # RBICSマスターデータとの結合（REVENUE_L6_NAME, REVENUE_DESCRを追加）
+        df = df.merge(
+            rbics_master[["L6_ID", "L6_NAME", "L6_DESCR"]].rename(
+                columns={"L6_ID": "REVENUE_L6_ID", "L6_NAME": "REVENUE_L6_NAME", "L6_DESCR": "REVENUE_DESCR"}
+            ),
+            on="REVENUE_L6_ID",
+            how="left"
+        )
+
+        # テキスト前処理（カンマをハイフンに置換）
+        if 'REVENUE_L6_NAME' in df.columns:
+            df['REVENUE_L6_NAME'] = df['REVENUE_L6_NAME'].str.replace(',', '-')
 
         return df
 

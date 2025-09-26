@@ -52,7 +52,7 @@ from .query_params import FactSetTradenameQueryParams
 
 # RBICSプロバイダーをインポート（L6_NAME取得用）
 from data_providers.sources.factset_rbics.provider import RBICSProvider
-from data_providers.sources.factset_rbics.types import RBICSQueryParams
+from data_providers.sources.factset_rbics.query_params import RBICSQueryParams
 
 
 logger = get_logger(__name__)
@@ -248,7 +248,6 @@ class FactSetTradenameProvider(BaseProvider):
 
         - 必要列: `TRADE_ID`, `FACTSET_ENTITY_ID`, `PRODUCT_ID`, `PRODUCT_NAME`,
           `L6_ID`, `START_DATE`, `END_DATE`, `MULTI_ASSIGN_FLAG`
-        - 注意: `L6_NAME`はデータベーステーブルに存在しないため取得されません
 
         Args:
             params: フィルタ条件（企業ID・商品名・期間・件数制限 など）。
