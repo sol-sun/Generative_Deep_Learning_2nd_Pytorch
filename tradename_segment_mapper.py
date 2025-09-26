@@ -413,10 +413,10 @@ class TradenameSegmentMapper:
         )
 
         try:
-            # セグメントデータの取得
-            sector_df = rbics_provider._query_revenue_segment_data(query_params)
+            # セグメントデータの取得（生データ）
+            raw_sector_df = rbics_provider._query_revenue_segment_data(query_params)
             
-            if sector_df.empty:
+            if raw_sector_df.empty:
                 raise ValueError("セグメントデータが取得できませんでした")
 
             # RBICSマスターデータの取得（REVENUE_L6_NAME, REVENUE_DESCR用）
@@ -429,10 +429,10 @@ class TradenameSegmentMapper:
             logger.error(f"データ取得エラー: {e}")
             raise
 
-        # データの前処理
-        sector_df = self._preprocess_sector_data(sector_df, rbics_master)
+        # データの前処理（処理済みデータ）
+        processed_sector_df = self._preprocess_sector_data(raw_sector_df, rbics_master)
         
-        return sector_df
+        return processed_sector_df
 
     def _preprocess_sector_data(self, df: pd.DataFrame, rbics_master: pd.DataFrame) -> pd.DataFrame:
         """セクターデータの前処理。
