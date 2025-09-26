@@ -10,7 +10,7 @@ GPU環境での実行が必要で、埋め込みモデルを使用してセク�
 商品名データのマッピングを生成します。
 
 使用方法:
-    $ python -m gppm.cli.generate_mapping --output-path /path/to/mapping_df.pkl
+    $ python -m gppm.cli.gen_tradename_mapping --output-path /path/to/mapping_df.pkl
 
 必要な環境:
     - GPU環境（CUDA有効）
@@ -18,7 +18,7 @@ GPU環境での実行が必要で、埋め込みモデルを使用してセク�
     - データベース接続
 
 設定例:
-    python -m gppm.cli.generate_mapping \\
+    python -m gppm.cli.gen_tradename_mapping \\
         --output-path /home/user/mapping_df.pkl \\
         --model-path /path/to/embedding/model \\
         --chunk-size 100000 \\
@@ -47,11 +47,14 @@ def create_argument_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-    # 基本的な使用方法
-    python -m gppm.cli.generate_mapping --output-path /path/to/mapping_df.pkl
+    # 基本的な使用方法（設定ファイルの値を使用）
+    python -m gppm.cli.gen_tradename_mapping
+    
+    # 出力パスのみ指定
+    python -m gppm.cli.gen_tradename_mapping --output-path /path/to/mapping_df.pkl
     
     # 詳細設定での使用方法
-    python -m gppm.cli.generate_mapping \\
+    python -m gppm.cli.gen_tradename_mapping \\
         --output-path /home/user/mapping_df.pkl \\
         --model-path /path/to/embedding/model \\
         --chunk-size 100000 \\
@@ -60,90 +63,54 @@ def create_argument_parser() -> argparse.ArgumentParser:
         """
     )
 
-    # 必須引数
+    # オプション引数（デフォルト値はNoneにして、後で設定ファイルから取得）
     parser.add_argument(
         "--output-path",
         type=str,
-        required=True,
-        help="出力ファイルパス（.pkl形式）"
+        default=None,
+        help="出力ファイルパス（.pkl形式）（設定ファイルの値を使用する場合は省略）"
     )
 
-    # 設定ファイルからデフォルト値を取得
-    try:
-        config_manager = ConfigManager()
-        config = config_manager.get_config()
-        if config.tradename_segment_mapper:
-            default_model_path = config.tradename_segment_mapper.model_path
-            default_chunk_size = config.tradename_segment_mapper.processing.chunk_size
-            default_batch_size = config.tradename_segment_mapper.processing.batch_size
-            default_max_items = config.tradename_segment_mapper.processing.max_items_per_entity
-            default_initial_k = config.tradename_segment_mapper.search.initial_k
-            default_increment_factor = config.tradename_segment_mapper.search.increment_factor
-        else:
-            # 設定ファイルにtradename_segment_mapperがない場合はデフォルト値を使用
-            default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
-            default_chunk_size = 100000
-            default_batch_size = 10000
-            default_max_items = 100
-            default_initial_k = 100000
-            default_increment_factor = 2
-    except Exception:
-        # 設定ファイルの読み込みに失敗した場合はデフォルト値を使用
-        default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
-        default_chunk_size = 100000
-        default_batch_size = 10000
-        default_max_items = 100
-        default_initial_k = 100000
-        default_increment_factor = 2
-
-    # オプション引数
     parser.add_argument(
         "--model-path",
         type=str,
-        default=default_model_path,
-        help=f"埋め込みモデルのパス（デフォルト: {default_model_path}）"
+        default=None,
+        help="埋め込みモデルのパス（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=default_chunk_size,
-        help=f"ドキュメント分割サイズ（デフォルト: {default_chunk_size}）"
+        default=None,
+        help="ドキュメント分割サイズ（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=default_batch_size,
-        help=f"バッチサイズ（デフォルト: {default_batch_size}）"
+        default=None,
+        help="バッチサイズ（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
         "--max-items-per-entity",
         type=int,
-        default=default_max_items,
-        help=f"企業あたりの最大商品数（デフォルト: {default_max_items}）"
+        default=None,
+        help="企業あたりの最大商品数（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
         "--initial-k",
         type=int,
-        default=default_initial_k,
-        help=f"初期検索結果数（デフォルト: {default_initial_k}）"
+        default=None,
+        help="初期検索結果数（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
         "--increment-factor",
         type=int,
-        default=default_increment_factor,
-        help=f"k増加倍率（デフォルト: {default_increment_factor}）"
-    )
-
-
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="詳細なログ出力を有効にする"
+        default=None,
+        help="k増加倍率（設定ファイルの値を使用する場合は省略）"
     )
 
     return parser
@@ -159,38 +126,77 @@ def validate_arguments(args: argparse.Namespace) -> None:
         ValueError: 引数が不正な場合
         FileNotFoundError: 必要なファイルが見つからない場合
     """
+    # 設定ファイルからデフォルト値を取得
+    try:
+        config_manager = ConfigManager()
+        config = config_manager.get_config()
+        
+        if config.tradename_segment_mapper:
+            default_output_path = config.tradename_segment_mapper.output.file_path
+            default_model_path = config.tradename_segment_mapper.model_path
+            default_chunk_size = config.tradename_segment_mapper.processing.chunk_size
+            default_batch_size = config.tradename_segment_mapper.processing.batch_size
+            default_max_items = config.tradename_segment_mapper.processing.max_items_per_entity
+            default_initial_k = config.tradename_segment_mapper.search.initial_k
+            default_increment_factor = config.tradename_segment_mapper.search.increment_factor
+        else:
+            default_output_path = "/tmp/mapping_df.pkl"
+            default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
+            default_chunk_size = 100000
+            default_batch_size = 10000
+            default_max_items = 100
+            default_initial_k = 100000
+            default_increment_factor = 2
+    except Exception:
+        default_output_path = "/tmp/mapping_df.pkl"
+        default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
+        default_chunk_size = 100000
+        default_batch_size = 10000
+        default_max_items = 100
+        default_initial_k = 100000
+        default_increment_factor = 2
+
+    # 実際に使用される値を決定
+    output_path = args.output_path if args.output_path is not None else default_output_path
+    model_path = args.model_path if args.model_path is not None else default_model_path
+    chunk_size = args.chunk_size if args.chunk_size is not None else default_chunk_size
+    batch_size = args.batch_size if args.batch_size is not None else default_batch_size
+    max_items = args.max_items_per_entity if args.max_items_per_entity is not None else default_max_items
+    initial_k = args.initial_k if args.initial_k is not None else default_initial_k
+    increment_factor = args.increment_factor if args.increment_factor is not None else default_increment_factor
+
     # 出力パスの検証
-    output_path = Path(args.output_path)
-    if not output_path.suffix == '.pkl':
+    output_path_obj = Path(output_path)
+    if not output_path_obj.suffix == '.pkl':
         raise ValueError("出力ファイルは.pkl形式である必要があります")
     
     # 親ディレクトリの作成
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     # モデルパスの検証
-    model_path = Path(args.model_path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"モデルパスが存在しません: {args.model_path}")
+    model_path_obj = Path(model_path)
+    if not model_path_obj.exists():
+        raise FileNotFoundError(f"モデルパスが存在しません: {model_path}")
 
     # 数値引数の検証
-    if args.chunk_size <= 0:
+    if chunk_size <= 0:
         raise ValueError("chunk-sizeは正の数である必要があります")
     
-    if args.batch_size <= 0:
+    if batch_size <= 0:
         raise ValueError("batch-sizeは正の数である必要があります")
     
-    if args.max_items_per_entity <= 0:
+    if max_items <= 0:
         raise ValueError("max-items-per-entityは正の数である必要があります")
     
-    if args.initial_k <= 0:
+    if initial_k <= 0:
         raise ValueError("initial-kは正の数である必要があります")
     
-    if args.increment_factor <= 0:
+    if increment_factor <= 0:
         raise ValueError("increment-factorは正の数である必要があります")
 
 
 def create_mapping_config(args: argparse.Namespace) -> TradenameSegmentMapperConfig:
-    """引数からTradenameSegmentMapperConfigを作成。
+    """引数と設定ファイルからTradenameSegmentMapperConfigを作成。
 
     Args:
         args: 解析された引数
@@ -198,15 +204,49 @@ def create_mapping_config(args: argparse.Namespace) -> TradenameSegmentMapperCon
     Returns:
         作成されたTradenameSegmentMapperConfig
     """
-    # 引数の値を使用（設定ファイルのデフォルト値は既に引数パーサーで適用済み）
+    # 設定ファイルからデフォルト値を取得
+    try:
+        config_manager = ConfigManager()
+        config = config_manager.get_config()
+        
+        if config.tradename_segment_mapper:
+            # 設定ファイルの値を使用
+            default_output_path = config.tradename_segment_mapper.output.file_path
+            default_model_path = config.tradename_segment_mapper.model_path
+            default_chunk_size = config.tradename_segment_mapper.processing.chunk_size
+            default_batch_size = config.tradename_segment_mapper.processing.batch_size
+            default_max_items = config.tradename_segment_mapper.processing.max_items_per_entity
+            default_initial_k = config.tradename_segment_mapper.search.initial_k
+            default_increment_factor = config.tradename_segment_mapper.search.increment_factor
+        else:
+            # 設定ファイルにtradename_segment_mapperがない場合はデフォルト値を使用
+            default_output_path = "/tmp/mapping_df.pkl"
+            default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
+            default_chunk_size = 100000
+            default_batch_size = 10000
+            default_max_items = 100
+            default_initial_k = 100000
+            default_increment_factor = 2
+    except Exception as e:
+        logger.warning(f"設定ファイルの読み込みに失敗: {e}")
+        # 設定ファイルの読み込みに失敗した場合はデフォルト値を使用
+        default_output_path = "/tmp/mapping_df.pkl"
+        default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
+        default_chunk_size = 100000
+        default_batch_size = 10000
+        default_max_items = 100
+        default_initial_k = 100000
+        default_increment_factor = 2
+
+    # コマンドライン引数が指定されている場合はそれを使用、そうでなければ設定ファイルの値を使用
     return TradenameSegmentMapperConfig(
-        model_path=args.model_path,
-        chunk_size=args.chunk_size,
-        max_items_per_entity=args.max_items_per_entity,
-        initial_k=args.initial_k,
-        increment_factor=args.increment_factor,
-        batch_size=args.batch_size,
-        output_path=args.output_path,
+        model_path=args.model_path if args.model_path is not None else default_model_path,
+        chunk_size=args.chunk_size if args.chunk_size is not None else default_chunk_size,
+        max_items_per_entity=args.max_items_per_entity if args.max_items_per_entity is not None else default_max_items,
+        initial_k=args.initial_k if args.initial_k is not None else default_initial_k,
+        increment_factor=args.increment_factor if args.increment_factor is not None else default_increment_factor,
+        batch_size=args.batch_size if args.batch_size is not None else default_batch_size,
+        output_path=args.output_path if args.output_path is not None else default_output_path,
     )
 
 
@@ -224,17 +264,19 @@ def main() -> int:
         # 引数の検証
         validate_arguments(args)
 
-        # ログレベルの設定
-        if args.verbose:
-            import logging
-            logging.getLogger().setLevel(logging.DEBUG)
-
         logger.info("Tradename Segment Mapping生成開始")
-        logger.info(f"出力パス: {args.output_path}")
-        logger.info(f"モデルパス: {args.model_path}")
-
+        
         # 設定の作成
         config = create_mapping_config(args)
+        
+        # 実際に使用される値をログ出力
+        logger.info(f"出力パス: {config.output_path}")
+        logger.info(f"モデルパス: {config.model_path}")
+        logger.info(f"チャンクサイズ: {config.chunk_size}")
+        logger.info(f"バッチサイズ: {config.batch_size}")
+        logger.info(f"最大商品数: {config.max_items_per_entity}")
+        logger.info(f"初期K: {config.initial_k}")
+        logger.info(f"増加倍率: {config.increment_factor}")
 
         # TradenameSegmentMapperの実行
         mapper = TradenameSegmentMapper(config)
@@ -262,9 +304,6 @@ def main() -> int:
         return 1
     except Exception as e:
         logger.error(f"エラーが発生しました: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
         return 1
 
 
