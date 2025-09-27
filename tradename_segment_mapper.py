@@ -31,11 +31,13 @@ from __future__ import annotations
 import os
 import re
 import pickle
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import lru_cache
+import multiprocessing as mp
 
 import pandas as pd
 import numpy as np
@@ -54,6 +56,7 @@ from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import DataFrameLoader
 from tqdm import tqdm
+import faiss
 
 from gppm.core.config_manager import get_logger
 from data_providers.sources.factset_rbics.provider import RBICSProvider
@@ -94,18 +97,34 @@ class TradenameSegmentMapperConfig(BaseModel):
         description="企業あたりの最大商品数"
     )
 
-    # 検索設定
-    initial_k: int = Field(
-        default=100000,
-        description="初期検索結果数"
+    # 検索・マッピング設定
+    initial_search_ratio: float = Field(
+        default=0.05,
+        description="初期検索候補数（総データ数の割合）"
     )
-    increment_factor: int = Field(
+    search_expansion_factor: int = Field(
         default=2,
-        description="k増加倍率"
+        description="検索候補増加倍率"
+    )
+    max_search_ratio: float = Field(
+        default=0.95,
+        description="最大検索候補数（総データ数の割合）"
+    )
+    search_timeout: int = Field(
+        default=3600,
+        description="検索タイムアウト（秒）"
     )
     batch_size: int = Field(
-        default=10000,
+        default=5000,
         description="バッチサイズ"
+    )
+    cpu_workers: int = Field(
+        default=4,
+        description="CPU並列ワーカー数"
+    )
+    gpu_batch_size: int = Field(
+        default=1000,
+        description="GPU並列バッチサイズ"
     )
 
     # 出力設定
@@ -130,12 +149,20 @@ class TradenameSegmentMapperConfig(BaseModel):
             parent_dir.mkdir(parents=True, exist_ok=True)
         return v
 
-    @field_validator("chunk_size", "batch_size", "max_items_per_entity", "initial_k", "increment_factor")
+    @field_validator("chunk_size", "batch_size", "max_items_per_entity", "search_expansion_factor", "search_timeout", "cpu_workers", "gpu_batch_size")
     @classmethod
     def _validate_positive_integers(cls, v: int) -> int:
         """正の整数の検証。"""
         if v <= 0:
             raise ValueError("値は正の数である必要があります")
+        return v
+
+    @field_validator("initial_search_ratio", "max_search_ratio")
+    @classmethod
+    def _validate_ratios(cls, v: float) -> float:
+        """割合の検証。"""
+        if not 0 < v <= 1:
+            raise ValueError("割合は0より大きく1以下である必要があります")
         return v
 
     @model_validator(mode="after")
@@ -144,8 +171,11 @@ class TradenameSegmentMapperConfig(BaseModel):
         if self.chunk_size < self.batch_size:
             raise ValueError("chunk_sizeはbatch_size以上である必要があります")
         
-        if self.initial_k < self.batch_size:
-            raise ValueError("initial_kはbatch_size以上である必要があります")
+        if self.initial_search_ratio > self.max_search_ratio:
+            raise ValueError("initial_search_ratioはmax_search_ratio以下である必要があります")
+        
+        if self.search_expansion_factor <= 1:
+            raise ValueError("search_expansion_factorは1より大きい必要があります")
         
         return self
 
@@ -294,16 +324,29 @@ class TradenameSegmentMapper:
         )
         self._embedding_model: Optional[HuggingFaceEmbeddings] = None
         self._sentence_transformer: Optional[SentenceTransformer] = None
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(max_workers=self.config.cpu_workers)
+        self._process_executor = ProcessPoolExecutor(max_workers=min(4, mp.cpu_count()))
+        self._gpu_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._mapping_cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        self._performance_stats = {
+            "total_queries": 0,
+            "successful_mappings": 0,
+            "failed_mappings": 0,
+            "processing_time": 0.0
+        }
         
-        logger.info("TradenameSegmentMapper初期化完了")
+        logger.info(f"TradenameSegmentMapper初期化完了 - GPU: {torch.cuda.is_available()}, "
+                   f"CPU並列ワーカー: {self.config.cpu_workers}, "
+                   f"バッチサイズ: {self.config.batch_size}")
 
     def __del__(self):
         """リソースクリーンアップ。"""
         if hasattr(self, '_executor'):
             self._executor.shutdown(wait=False)
+        if hasattr(self, '_process_executor'):
+            self._process_executor.shutdown(wait=False)
 
-    def generate_mapping_df(self, output_path: Optional[str] = None) -> MappingResult:
+    def generate_mapping_df(self, output_path: Optional[str] = None) -> TradenameSegmentMapperResult:
         """Mapping DataFrame生成のメイン処理。
 
         Args:
@@ -372,7 +415,9 @@ class TradenameSegmentMapper:
                 "GPU環境が利用できません。CUDAが有効な環境で実行してください。"
             )
         
-        logger.info(f"GPU環境確認完了: {torch.cuda.get_device_name(0)}")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"GPU環境確認完了: {gpu_name}, メモリ: {gpu_memory:.1f}GB")
 
     def _load_embedding_model(self) -> None:
         """埋め込みモデルの読み込み。"""
@@ -621,6 +666,7 @@ class TradenameSegmentMapper:
             作成されたベクトルストア
         """
         logger.info("ベクトルストア作成開始")
+        start_time = time.time()
 
         # セクターデータの処理
         sector_df_processed = sector_df[["FACTSET_ENTITY_ID", "SEG_SHARE", "SEGMENT_NAME", "REVENUE_L6_ID", 
@@ -639,33 +685,62 @@ class TradenameSegmentMapper:
         documents1 = loader1.load()
         documents2 = loader2.load()
 
-        # ドキュメントの分割
-        def split_documents(documents, chunk_size):
+        # メモリ効率的なドキュメント分割
+        def split_documents_optimized(documents, chunk_size):
             for start in range(0, len(documents), chunk_size):
                 yield documents[start:start + chunk_size]
 
-        chunks1 = list(split_documents(documents1, self.config.chunk_size))
-        chunks2 = list(split_documents(documents2, self.config.chunk_size))
+        chunks1 = list(split_documents_optimized(documents1, self.config.chunk_size))
+        chunks2 = list(split_documents_optimized(documents2, self.config.chunk_size))
+
+        # 並列処理でベクトルストア作成
+        def create_vectorstore_chunk(chunk, embedding_model):
+            return FAISS.from_documents(chunk, embedding_model)
 
         # セクターデータのベクトルストア作成（検索先）
+        logger.info("セクターデータベクトルストア作成開始")
         vectorstore_searched = None
-        for chunk in chunks1:
-            if vectorstore_searched is None:
-                vectorstore_searched = FAISS.from_documents(chunk, self._embedding_model)
-            else:
-                temp_vectorstore = FAISS.from_documents(chunk, self._embedding_model)
-                vectorstore_searched.merge_from(temp_vectorstore)
+        for i, chunk in enumerate(tqdm(chunks1, desc="セクターデータ処理")):
+            try:
+                if vectorstore_searched is None:
+                    vectorstore_searched = create_vectorstore_chunk(chunk, self._embedding_model)
+                else:
+                    temp_vectorstore = create_vectorstore_chunk(chunk, self._embedding_model)
+                    vectorstore_searched.merge_from(temp_vectorstore)
+                    
+                # メモリクリーンアップ
+                if 'temp_vectorstore' in locals():
+                    del temp_vectorstore
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"セクターデータチャンク{i}処理エラー: {e}")
+                continue
 
         # 商品名データのベクトルストア作成（検索元）
+        logger.info("商品名データベクトルストア作成開始")
         vectorstore_search = None
-        for chunk in chunks2:
-            if vectorstore_search is None:
-                vectorstore_search = FAISS.from_documents(chunk, self._embedding_model)
-            else:
-                temp_vectorstore = FAISS.from_documents(chunk, self._embedding_model)
-                vectorstore_search.merge_from(temp_vectorstore)
+        for i, chunk in enumerate(tqdm(chunks2, desc="商品名データ処理")):
+            try:
+                if vectorstore_search is None:
+                    vectorstore_search = create_vectorstore_chunk(chunk, self._embedding_model)
+                else:
+                    temp_vectorstore = create_vectorstore_chunk(chunk, self._embedding_model)
+                    vectorstore_search.merge_from(temp_vectorstore)
+                    
+                # メモリクリーンアップ
+                if 'temp_vectorstore' in locals():
+                    del temp_vectorstore
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"商品名データチャンク{i}処理エラー: {e}")
+                continue
 
-        logger.info(f"ベクトルストア作成完了: 検索先={vectorstore_searched.index.ntotal}件, 検索元={vectorstore_search.index.ntotal}件")
+        elapsed_time = time.time() - start_time
+        logger.info(f"ベクトルストア作成完了: 検索先={vectorstore_searched.index.ntotal}件, 検索元={vectorstore_search.index.ntotal}件 (処理時間: {elapsed_time:.2f}秒)")
         return vectorstore_search, vectorstore_searched
 
     def _remove_illegal_characters(self, value: str) -> str:
@@ -685,6 +760,7 @@ class TradenameSegmentMapper:
             生成されたマッピングDataFrame
         """
         logger.info("マッピング生成開始")
+        start_time = time.time()
 
         # クエリ準備（検索元ベクトルストアから）
         doc_id_to_faiss_id = {v: k for k, v in vectorstore_search.index_to_docstore_id.items()}
@@ -705,64 +781,191 @@ class TradenameSegmentMapper:
 
         # マッピング生成
         mapping = {}
-        faiss_index = vectorstore_searched.index  # 検索先のインデックスを使用
+        faiss_index = vectorstore_searched.index
         N = len(queries_embeddings)
+        total_docs = vectorstore_searched.index.ntotal
         unmapped_indices = set(range(N))
-        k = self.config.initial_k
-        increment_factor = self.config.increment_factor
+        
+        # パーセンテージベースの検索設定
+        initial_search_count = int(total_docs * self.config.initial_search_ratio)
+        max_search_count = int(total_docs * self.config.max_search_ratio)
+        search_expansion_factor = self.config.search_expansion_factor
         batch_size = self.config.batch_size
-        max_k = vectorstore_searched.index.ntotal
+        search_timeout = self.config.search_timeout
 
-        while unmapped_indices:
-            logger.info(f"検索実行: k={k}, 未マッピング={len(unmapped_indices)}")
+        # 最適化されたバッチ処理（キャッシュ機能付き）
+        def process_batch_optimized(batch_indices, query_batch, batch_metadata, k_val):
+            batch_mapping = {}
+            batch_unmapped = set()
             
-            unmapped_list = list(unmapped_indices)
-            
-            for start_idx in range(0, len(unmapped_list), batch_size):
-                batch_indices = unmapped_list[start_idx : start_idx + batch_size]
-                query_batch = queries_embeddings[batch_indices]
-                batch_metadata = [query_metadata_list[i] for i in batch_indices]
+            try:
+                # キャッシュチェック
+                cache_hits = 0
+                for i, (factset_id_query, l6_id) in enumerate(batch_metadata):
+                    cache_key = (factset_id_query, l6_id)
+                    if cache_key in self._mapping_cache:
+                        batch_mapping[cache_key] = self._mapping_cache[cache_key]
+                        cache_hits += 1
+                    else:
+                        batch_unmapped.add(batch_indices[i])
                 
-                distances, indices = faiss_index.search(query_batch, k)
+                if cache_hits > 0:
+                    logger.debug(f"キャッシュヒット: {cache_hits}/{len(batch_metadata)}")
+                
+                if not batch_unmapped:
+                    return batch_mapping, set()
+                
+                # GPU並列検索
+                distances, indices = faiss_index.search(query_batch, k_val)
                 candidate_idxs = set(indices.flatten())
                 candidate_idxs.discard(-1)
                 
-                candidate_doc_ids = {idx: vectorstore_searched.index_to_docstore_id[idx] for idx in candidate_idxs}
-                candidate_docs = {
-                    doc_id: vectorstore_searched.docstore.search(doc_id)
-                    for doc_id in candidate_doc_ids.values()
-                }
+                if candidate_idxs:
+                    # 候補ドキュメントの並列取得
+                    candidate_doc_ids = {idx: vectorstore_searched.index_to_docstore_id[idx] for idx in candidate_idxs}
+                    candidate_docs = {
+                        doc_id: vectorstore_searched.docstore.search(doc_id)
+                        for doc_id in candidate_doc_ids.values()
+                    }
 
-                for i, idx_list in enumerate(indices):
-                    global_i = batch_indices[i]
-                    factset_id_query, l6_id = batch_metadata[i]
-
-                    for idx in idx_list:
-                        if idx == -1:
+                    # 効率的なマッピング検索
+                    for i, idx_list in enumerate(indices):
+                        global_i = batch_indices[i]
+                        factset_id_query, l6_id = batch_metadata[i]
+                        
+                        # キャッシュチェック
+                        cache_key = (factset_id_query, l6_id)
+                        if cache_key in self._mapping_cache:
+                            batch_mapping[cache_key] = self._mapping_cache[cache_key]
                             continue
+                        
+                        # 早期終了のための最適化
+                        found = False
+                        for idx in idx_list:
+                            if idx == -1:
+                                continue
 
-                        doc_id = candidate_doc_ids.get(idx)
-                        doc = candidate_docs.get(doc_id)
+                            doc_id = candidate_doc_ids.get(idx)
+                            doc = candidate_docs.get(doc_id)
 
-                        if doc is not None and doc.metadata.get("FACTSET_ENTITY_ID") == factset_id_query:
-                            revere_l6_id = doc.metadata.get("REVENUE_L6_ID")
-                            mapping[(factset_id_query, l6_id)] = (factset_id_query, revere_l6_id)
-                            unmapped_indices.remove(global_i)
-                            break
+                            if doc is not None and doc.metadata.get("FACTSET_ENTITY_ID") == factset_id_query:
+                                revere_l6_id = doc.metadata.get("REVENUE_L6_ID")
+                                mapping_result = (factset_id_query, revere_l6_id)
+                                batch_mapping[cache_key] = mapping_result
+                                self._mapping_cache[cache_key] = mapping_result
+                                found = True
+                                break
+                        
+                        if not found:
+                            batch_unmapped.add(global_i)
+                else:
+                    batch_unmapped = set(batch_indices)
+                    
+            except Exception as e:
+                logger.error(f"バッチ処理エラー: {e}")
+                batch_unmapped = set(batch_indices)
+            
+            return batch_mapping, batch_unmapped
 
-            if unmapped_indices:
-                if k > max_k:
-                    logger.warning("最大kに到達しました。ループを終了します。")
+        iteration = 0
+        current_search_count = initial_search_count
+        
+        with tqdm(total=N, desc="マッピング生成", unit="件", 
+                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+            while unmapped_indices:
+                iteration += 1
+                batch_start_time = time.time()
+                
+                logger.info(f"検索実行: 検索候補数={current_search_count}, 未マッピング={len(unmapped_indices)}, 反復={iteration}")
+                
+                unmapped_list = list(unmapped_indices)
+                batch_mappings = {}
+                new_unmapped = set()
+                
+                # 並列処理でバッチを処理
+                futures = []
+                for start_idx in range(0, len(unmapped_list), batch_size):
+                    batch_indices = unmapped_list[start_idx : start_idx + batch_size]
+                    query_batch = queries_embeddings[batch_indices]
+                    batch_metadata = [query_metadata_list[i] for i in batch_indices]
+                    
+                    future = self._executor.submit(process_batch_optimized, batch_indices, query_batch, batch_metadata, current_search_count)
+                    futures.append(future)
+                
+                # 結果を収集
+                successful_batches = 0
+                for future in futures:
+                    try:
+                        batch_mapping, batch_unmapped = future.result(timeout=300)
+                        batch_mappings.update(batch_mapping)
+                        new_unmapped.update(batch_unmapped)
+                        successful_batches += 1
+                    except Exception as e:
+                        logger.error(f"バッチ処理エラー: {e}")
+                        continue
+                
+                # マッピング結果を統合
+                mapping.update(batch_mappings)
+                unmapped_indices = new_unmapped
+                
+                # パフォーマンス統計更新
+                self._performance_stats["total_queries"] += len(unmapped_list)
+                self._performance_stats["successful_mappings"] += len(batch_mappings)
+                self._performance_stats["failed_mappings"] += len(new_unmapped)
+                
+                # プログレス更新
+                mapped_count = len(mapping)
+                pbar.update(mapped_count - pbar.n)
+                
+                # 詳細な進捗情報
+                batch_time = time.time() - batch_start_time
+                success_rate = len(batch_mappings) / len(unmapped_list) if unmapped_list else 0
+                logger.info(f"バッチ処理完了: 成功={len(batch_mappings)}, 失敗={len(new_unmapped)}, "
+                           f"成功率={success_rate:.2%}, 処理時間={batch_time:.2f}秒")
+                
+                # 早期終了条件
+                if not unmapped_indices:
                     break
-                k *= increment_factor
+                    
+                if current_search_count >= max_search_count:
+                    logger.warning(f"最大検索候補数({max_search_count})に到達しました。ループを終了します。")
+                    break
+                    
+                current_search_count = min(current_search_count * search_expansion_factor, max_search_count)
+                
+                # 時間制限チェック
+                elapsed_time = time.time() - start_time
+                if elapsed_time > search_timeout:
+                    logger.warning(f"検索タイムアウト({search_timeout}秒)に達しました。処理を終了します。")
+                    break
 
-        logger.info(f"マッピング完了: {len(mapping)} 件 / {N} 件")
+        elapsed_time = time.time() - start_time
+        self._performance_stats["processing_time"] = elapsed_time
+        
+        # 最終統計情報
+        final_success_rate = len(mapping) / N if N > 0 else 0
+        logger.info(f"マッピング完了: {len(mapping)} 件 / {N} 件 (処理時間: {elapsed_time:.2f}秒, 成功率: {final_success_rate:.2%})")
+        logger.info(f"パフォーマンス統計: 総クエリ={self._performance_stats['total_queries']}, "
+                   f"成功マッピング={self._performance_stats['successful_mappings']}, "
+                   f"失敗マッピング={self._performance_stats['failed_mappings']}")
 
-        # DataFrameに変換
-        mapping_df = pd.DataFrame.from_dict(mapping, orient='index').reset_index()
-        mapping_df[['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID']] = pd.DataFrame(mapping_df['index'].tolist(), index=mapping_df.index)
-        mapping_df['RELABEL_L6_ID'] = mapping_df[1]
-        mapping_df = mapping_df.drop(columns=['index', 0])[['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID', 'RELABEL_L6_ID']]
+        # DataFrameに変換（エラーハンドリング付き）
+        try:
+            mapping_df = pd.DataFrame.from_dict(mapping, orient='index').reset_index()
+            mapping_df[['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID']] = pd.DataFrame(mapping_df['index'].tolist(), index=mapping_df.index)
+            mapping_df['RELABEL_L6_ID'] = mapping_df[1]
+            mapping_df = mapping_df.drop(columns=['index', 0])[['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID', 'RELABEL_L6_ID']]
+            
+            # データ検証
+            if mapping_df.empty:
+                logger.warning("マッピング結果が空です")
+            else:
+                logger.info(f"DataFrame作成完了: {len(mapping_df)} 行")
+                
+        except Exception as e:
+            logger.error(f"DataFrame変換エラー: {e}")
+            # 空のDataFrameを返す
+            mapping_df = pd.DataFrame(columns=['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID', 'RELABEL_L6_ID'])
 
         return mapping_df
 

@@ -23,25 +23,22 @@ output:
   files:
     # 変分推論結果ファイル
     variational_result: "variational_inference_result.pkl"
+    # データセットファイル
+    dataset: "dataset.pkl"
     # CSV処理結果ファイル
     csv_processed: "csv_processed_result.pkl"
-    # 統合結果ファイル（変分推論 + CSV処理）
-    integrated: "integrated_analysis_result.pkl"
 
 # =============================================================================
 # 3. 変分推論設定（ベイズ分析の核心）
 # =============================================================================
 # 変分推論によるベイズ分析の設定
 variational_inference:
-  # 既存の変分推論結果ファイル（統合処理で使用）
-  existing_result_path: "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202505/stan_result_15_usd2.pkl"
-  
   # 新しい変分推論を実行する場合の設定
-  new_inference:
+  inference_config:
     # 推論エンジン
-    engine: "cmdstanpy"  # cmdstanpy, pystan, numpyro
-    # Stanモデルファイル（nullの場合はデフォルトモデル）
-    model_file: null
+    engine: "cmdstanpy"  # cmdstanpy, pymc
+    # Stanモデルファイル（デフォルトモデル）
+    model_file: "src/gppm/analysis/bayesian/models/global_ppm_roic_model.stan"
     # サンプル数（事後分布からのサンプル数）
     samples: 2000
     # 最適化反復数（変分推論の最適化回数）
@@ -70,9 +67,67 @@ data_processing:
 log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
 # =============================================================================
-# 6. オプション設定
+# 6. CSV処理設定
+# =============================================================================
+# CSVファイル処理ツールで使用する設定
+# コマンドライン引数で上書き可能です
+csv_processing:
+  # 処理対象のCSVファイルパス（例: /path/to/your/data.csv）
+  input_file: null
+
+# =============================================================================
+# 7. プロダクトレベル設定
+# =============================================================================
+# 製品分類の階層レベル設定
+product_level:
+  # 使用する製品レベル（L6: 最詳細、L5: 詳細サブ業界）
+  level: "L6"  # L6, L5
+
+# =============================================================================
+# 8. オプション設定
 # =============================================================================
 # オプションのデータファイルパス
 # デフォルト値を使用する場合はnullのままにしてください
 optional_data:
   mapping_file: null
+
+# =============================================================================
+# 9. Tradename Segment Mapper設定
+# =============================================================================
+# FactSetデータを使用したTradename Segment Mapperの設定
+# GPU環境での実行が必要です
+tradename_segment_mapper:
+  # 埋め込みモデルのパス
+  model_path: "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
+  
+  # 出力設定
+  output:
+    # 出力ファイルパス（.pkl形式）
+    file_path: "/tmp/mapping_df.pkl"
+  
+  # データ処理設定
+  data_processing:
+    # ドキュメント分割サイズ
+    chunk_size: 100000
+    # バッチサイズ
+    batch_size: 5000
+    # 企業あたりの最大商標数
+    max_items_per_entity: 100
+  
+  # 検索・マッピング設定
+  search_mapping:
+    # 初期検索候補数（総データ数の割合）
+    initial_search_ratio: 0.05  # 5%
+    # 検索候補増加倍率
+    search_expansion_factor: 2
+    # 最大検索候補数（総データ数の割合）
+    max_search_ratio: 0.95  # 95%
+    # 検索タイムアウト（秒）
+    search_timeout: 3600
+  
+  # 並列処理設定
+  parallel_processing:
+    # CPU並列ワーカー数
+    cpu_workers: 4
+    # GPU並列バッチサイズ
+    gpu_batch_size: 1000

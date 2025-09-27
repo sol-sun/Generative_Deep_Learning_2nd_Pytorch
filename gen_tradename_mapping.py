@@ -100,17 +100,45 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--initial-k",
-        type=int,
+        "--initial-search-ratio",
+        type=float,
         default=None,
-        help="初期検索結果数（設定ファイルの値を使用する場合は省略）"
+        help="初期検索候補数（総データ数の割合、0.0-1.0）（設定ファイルの値を使用する場合は省略）"
     )
 
     parser.add_argument(
-        "--increment-factor",
+        "--search-expansion-factor",
         type=int,
         default=None,
-        help="k増加倍率（設定ファイルの値を使用する場合は省略）"
+        help="検索候補増加倍率（設定ファイルの値を使用する場合は省略）"
+    )
+
+    parser.add_argument(
+        "--max-search-ratio",
+        type=float,
+        default=None,
+        help="最大検索候補数（総データ数の割合、0.0-1.0）（設定ファイルの値を使用する場合は省略）"
+    )
+
+    parser.add_argument(
+        "--search-timeout",
+        type=int,
+        default=None,
+        help="検索タイムアウト（秒）（設定ファイルの値を使用する場合は省略）"
+    )
+
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=None,
+        help="CPU並列ワーカー数（設定ファイルの値を使用する場合は省略）"
+    )
+
+    parser.add_argument(
+        "--gpu-batch-size",
+        type=int,
+        default=None,
+        help="GPU並列バッチサイズ（設定ファイルの値を使用する場合は省略）"
     )
 
     return parser
@@ -134,27 +162,39 @@ def validate_arguments(args: argparse.Namespace) -> None:
         if config.tradename_segment_mapper:
             default_output_path = config.tradename_segment_mapper.output.file_path
             default_model_path = config.tradename_segment_mapper.model_path
-            default_chunk_size = config.tradename_segment_mapper.processing.chunk_size
-            default_batch_size = config.tradename_segment_mapper.processing.batch_size
-            default_max_items = config.tradename_segment_mapper.processing.max_items_per_entity
-            default_initial_k = config.tradename_segment_mapper.search.initial_k
-            default_increment_factor = config.tradename_segment_mapper.search.increment_factor
+            default_chunk_size = config.tradename_segment_mapper.data_processing.chunk_size
+            default_batch_size = config.tradename_segment_mapper.data_processing.batch_size
+            default_max_items = config.tradename_segment_mapper.data_processing.max_items_per_entity
+            default_initial_search_ratio = config.tradename_segment_mapper.search_mapping.initial_search_ratio
+            default_search_expansion_factor = config.tradename_segment_mapper.search_mapping.search_expansion_factor
+            default_max_search_ratio = config.tradename_segment_mapper.search_mapping.max_search_ratio
+            default_search_timeout = config.tradename_segment_mapper.search_mapping.search_timeout
+            default_cpu_workers = config.tradename_segment_mapper.parallel_processing.cpu_workers
+            default_gpu_batch_size = config.tradename_segment_mapper.parallel_processing.gpu_batch_size
         else:
             default_output_path = "/tmp/mapping_df.pkl"
             default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
             default_chunk_size = 100000
-            default_batch_size = 10000
+            default_batch_size = 5000
             default_max_items = 100
-            default_initial_k = 100000
-            default_increment_factor = 2
+            default_initial_search_ratio = 0.05
+            default_search_expansion_factor = 2
+            default_max_search_ratio = 0.95
+            default_search_timeout = 3600
+            default_cpu_workers = 4
+            default_gpu_batch_size = 1000
     except Exception:
         default_output_path = "/tmp/mapping_df.pkl"
         default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
         default_chunk_size = 100000
-        default_batch_size = 10000
+        default_batch_size = 5000
         default_max_items = 100
-        default_initial_k = 100000
-        default_increment_factor = 2
+        default_initial_search_ratio = 0.05
+        default_search_expansion_factor = 2
+        default_max_search_ratio = 0.95
+        default_search_timeout = 3600
+        default_cpu_workers = 4
+        default_gpu_batch_size = 1000
 
     # 実際に使用される値を決定
     output_path = args.output_path if args.output_path is not None else default_output_path
@@ -162,8 +202,12 @@ def validate_arguments(args: argparse.Namespace) -> None:
     chunk_size = args.chunk_size if args.chunk_size is not None else default_chunk_size
     batch_size = args.batch_size if args.batch_size is not None else default_batch_size
     max_items = args.max_items_per_entity if args.max_items_per_entity is not None else default_max_items
-    initial_k = args.initial_k if args.initial_k is not None else default_initial_k
-    increment_factor = args.increment_factor if args.increment_factor is not None else default_increment_factor
+    initial_search_ratio = args.initial_search_ratio if args.initial_search_ratio is not None else default_initial_search_ratio
+    search_expansion_factor = args.search_expansion_factor if args.search_expansion_factor is not None else default_search_expansion_factor
+    max_search_ratio = args.max_search_ratio if args.max_search_ratio is not None else default_max_search_ratio
+    search_timeout = args.search_timeout if args.search_timeout is not None else default_search_timeout
+    cpu_workers = args.cpu_workers if args.cpu_workers is not None else default_cpu_workers
+    gpu_batch_size = args.gpu_batch_size if args.gpu_batch_size is not None else default_gpu_batch_size
 
     # 出力パスの検証
     output_path_obj = Path(output_path)
@@ -188,11 +232,26 @@ def validate_arguments(args: argparse.Namespace) -> None:
     if max_items <= 0:
         raise ValueError("max-items-per-entityは正の数である必要があります")
     
-    if initial_k <= 0:
-        raise ValueError("initial-kは正の数である必要があります")
+    if not 0 < initial_search_ratio <= 1:
+        raise ValueError("initial-search-ratioは0より大きく1以下である必要があります")
     
-    if increment_factor <= 0:
-        raise ValueError("increment-factorは正の数である必要があります")
+    if search_expansion_factor <= 1:
+        raise ValueError("search-expansion-factorは1より大きい必要があります")
+    
+    if not 0 < max_search_ratio <= 1:
+        raise ValueError("max-search-ratioは0より大きく1以下である必要があります")
+    
+    if initial_search_ratio > max_search_ratio:
+        raise ValueError("initial-search-ratioはmax-search-ratio以下である必要があります")
+    
+    if search_timeout <= 0:
+        raise ValueError("search-timeoutは正の数である必要があります")
+    
+    if cpu_workers <= 0:
+        raise ValueError("cpu-workersは正の数である必要があります")
+    
+    if gpu_batch_size <= 0:
+        raise ValueError("gpu-batch-sizeは正の数である必要があります")
 
 
 def create_mapping_config(args: argparse.Namespace) -> TradenameSegmentMapperConfig:
@@ -213,39 +272,55 @@ def create_mapping_config(args: argparse.Namespace) -> TradenameSegmentMapperCon
             # 設定ファイルの値を使用
             default_output_path = config.tradename_segment_mapper.output.file_path
             default_model_path = config.tradename_segment_mapper.model_path
-            default_chunk_size = config.tradename_segment_mapper.processing.chunk_size
-            default_batch_size = config.tradename_segment_mapper.processing.batch_size
-            default_max_items = config.tradename_segment_mapper.processing.max_items_per_entity
-            default_initial_k = config.tradename_segment_mapper.search.initial_k
-            default_increment_factor = config.tradename_segment_mapper.search.increment_factor
+            default_chunk_size = config.tradename_segment_mapper.data_processing.chunk_size
+            default_batch_size = config.tradename_segment_mapper.data_processing.batch_size
+            default_max_items = config.tradename_segment_mapper.data_processing.max_items_per_entity
+            default_initial_search_ratio = config.tradename_segment_mapper.search_mapping.initial_search_ratio
+            default_search_expansion_factor = config.tradename_segment_mapper.search_mapping.search_expansion_factor
+            default_max_search_ratio = config.tradename_segment_mapper.search_mapping.max_search_ratio
+            default_search_timeout = config.tradename_segment_mapper.search_mapping.search_timeout
+            default_cpu_workers = config.tradename_segment_mapper.parallel_processing.cpu_workers
+            default_gpu_batch_size = config.tradename_segment_mapper.parallel_processing.gpu_batch_size
         else:
             # 設定ファイルにtradename_segment_mapperがない場合はデフォルト値を使用
             default_output_path = "/tmp/mapping_df.pkl"
             default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
             default_chunk_size = 100000
-            default_batch_size = 10000
+            default_batch_size = 5000
             default_max_items = 100
-            default_initial_k = 100000
-            default_increment_factor = 2
+            default_initial_search_ratio = 0.05
+            default_search_expansion_factor = 2
+            default_max_search_ratio = 0.95
+            default_search_timeout = 3600
+            default_cpu_workers = 4
+            default_gpu_batch_size = 1000
     except Exception as e:
         logger.warning(f"設定ファイルの読み込みに失敗: {e}")
         # 設定ファイルの読み込みに失敗した場合はデフォルト値を使用
         default_output_path = "/tmp/mapping_df.pkl"
         default_model_path = "/home/tmiyahara/repos/Neumann-Notebook/tmiyahara/202411/BAAI-bge-m3-langchain"
         default_chunk_size = 100000
-        default_batch_size = 10000
+        default_batch_size = 5000
         default_max_items = 100
-        default_initial_k = 100000
-        default_increment_factor = 2
+        default_initial_search_ratio = 0.05
+        default_search_expansion_factor = 2
+        default_max_search_ratio = 0.95
+        default_search_timeout = 3600
+        default_cpu_workers = 4
+        default_gpu_batch_size = 1000
 
     # コマンドライン引数が指定されている場合はそれを使用、そうでなければ設定ファイルの値を使用
     return TradenameSegmentMapperConfig(
         model_path=args.model_path if args.model_path is not None else default_model_path,
         chunk_size=args.chunk_size if args.chunk_size is not None else default_chunk_size,
         max_items_per_entity=args.max_items_per_entity if args.max_items_per_entity is not None else default_max_items,
-        initial_k=args.initial_k if args.initial_k is not None else default_initial_k,
-        increment_factor=args.increment_factor if args.increment_factor is not None else default_increment_factor,
+        initial_search_ratio=args.initial_search_ratio if args.initial_search_ratio is not None else default_initial_search_ratio,
+        search_expansion_factor=args.search_expansion_factor if args.search_expansion_factor is not None else default_search_expansion_factor,
+        max_search_ratio=args.max_search_ratio if args.max_search_ratio is not None else default_max_search_ratio,
+        search_timeout=args.search_timeout if args.search_timeout is not None else default_search_timeout,
         batch_size=args.batch_size if args.batch_size is not None else default_batch_size,
+        cpu_workers=args.cpu_workers if args.cpu_workers is not None else default_cpu_workers,
+        gpu_batch_size=args.gpu_batch_size if args.gpu_batch_size is not None else default_gpu_batch_size,
         output_path=args.output_path if args.output_path is not None else default_output_path,
     )
 
@@ -275,8 +350,12 @@ def main() -> int:
         logger.info(f"チャンクサイズ: {config.chunk_size}")
         logger.info(f"バッチサイズ: {config.batch_size}")
         logger.info(f"最大商品数: {config.max_items_per_entity}")
-        logger.info(f"初期K: {config.initial_k}")
-        logger.info(f"増加倍率: {config.increment_factor}")
+        logger.info(f"初期検索比率: {config.initial_search_ratio:.1%}")
+        logger.info(f"検索拡張倍率: {config.search_expansion_factor}")
+        logger.info(f"最大検索比率: {config.max_search_ratio:.1%}")
+        logger.info(f"検索タイムアウト: {config.search_timeout}秒")
+        logger.info(f"CPU並列ワーカー: {config.cpu_workers}")
+        logger.info(f"GPU並列バッチサイズ: {config.gpu_batch_size}")
 
         # TradenameSegmentMapperの実行
         mapper = TradenameSegmentMapper(config)
