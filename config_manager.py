@@ -123,10 +123,6 @@ class OutputFilesConfig(BaseModel):
         description="CSV処理結果ファイル名",
         examples=["csv_processed_result.pkl"]
     )
-    integrated: str = Field(
-        description="統合結果ファイル名",
-        examples=["integrated_analysis_result.pkl"]
-    )
 
 
 class OutputConfig(BaseModel):
@@ -198,12 +194,8 @@ class VariationalInferenceConfig(BaseModel):
     """変分推論全体設定。
 
     概要:
-    - 既存の変分推論結果ファイルと新しい推論設定を管理します。
+    - 推論設定を管理します。
     """
-    existing_result_path: Optional[str] = Field(
-        default=None,
-        description="既存の変分推論結果ファイルパス"
-    )
     inference_config: InferenceConfig = Field(
         description="新しい変分推論を実行する場合の設定"
     )
@@ -229,6 +221,31 @@ class DataProcessingConfig(BaseModel):
     )
 
 
+class CSVProcessingConfig(BaseModel):
+    """CSV処理設定。
+
+    概要:
+    - CSVファイル処理ツールで使用する設定を管理します。
+    """
+    input_file: Optional[str] = Field(
+        default=None,
+        description="処理対象のCSVファイルパス（コマンドライン引数で上書き可能）"
+    )
+
+
+class ProductLevelConfig(BaseModel):
+    """プロダクトレベル設定。
+
+    概要:
+    - 製品分類の階層レベル設定を管理します。
+    """
+    level: str = Field(
+        default="L6",
+        description="使用する製品レベル（L6: 最詳細、L5: 詳細サブ業界）",
+        examples=["L6", "L5"]
+    )
+
+
 class OptionalDataConfig(BaseModel):
     """オプションデータ設定。
 
@@ -241,6 +258,109 @@ class OptionalDataConfig(BaseModel):
     )
 
 
+class TradenameSegmentMapperOutputConfig(BaseModel):
+    """Tradename Segment Mapper出力設定。
+
+    概要:
+    - Tradename Segment Mapperの出力設定を管理します。
+    """
+    file_path: str = Field(
+        description="出力ファイルパス（.pkl形式）",
+        examples=["/tmp/mapping_df.pkl", "/data/mapping_df.pkl"]
+    )
+
+
+class TradenameSegmentMapperDataProcessingConfig(BaseModel):
+    """Tradename Segment Mapperデータ処理設定。
+
+    概要:
+    - Tradename Segment Mapperのデータ処理設定を管理します。
+    """
+    chunk_size: int = Field(
+        default=100000,
+        description="ドキュメント分割サイズ",
+        examples=[50000, 100000, 200000]
+    )
+    batch_size: int = Field(
+        default=5000,
+        description="バッチサイズ",
+        examples=[5000, 10000, 20000]
+    )
+    max_items_per_entity: int = Field(
+        default=100,
+        description="企業あたりの最大商品数",
+        examples=[50, 100, 200]
+    )
+
+
+class TradenameSegmentMapperSearchMappingConfig(BaseModel):
+    """Tradename Segment Mapper検索・マッピング設定。
+
+    概要:
+    - Tradename Segment Mapperの検索・マッピング設定を管理します。
+    """
+    initial_search_ratio: float = Field(
+        default=0.05,
+        description="初期検索候補数（総データ数の割合）",
+        examples=[0.05, 0.1, 0.2]
+    )
+    search_expansion_factor: int = Field(
+        default=2,
+        description="検索候補増加倍率",
+        examples=[2, 3, 4]
+    )
+    max_search_ratio: float = Field(
+        default=0.95,
+        description="最大検索候補数（総データ数の割合）",
+        examples=[0.8, 0.95, 1.0]
+    )
+    search_timeout: int = Field(
+        default=3600,
+        description="検索タイムアウト（秒）",
+        examples=[1800, 3600, 7200]
+    )
+
+
+class TradenameSegmentMapperParallelProcessingConfig(BaseModel):
+    """Tradename Segment Mapper並列処理設定。
+
+    概要:
+    - Tradename Segment Mapperの並列処理設定を管理します。
+    """
+    cpu_workers: int = Field(
+        default=4,
+        description="CPU並列ワーカー数",
+        examples=[2, 4, 8]
+    )
+    gpu_batch_size: int = Field(
+        default=1000,
+        description="GPU並列バッチサイズ",
+        examples=[500, 1000, 2000]
+    )
+
+
+class TradenameSegmentMapperConfig(BaseModel):
+    """Tradename Segment Mapper設定。
+
+    概要:
+    - FactSetデータを使用したTradename Segment Mapperの設定を管理します。
+    """
+    model_path: str = Field(
+        description="埋め込みモデルのパス",
+        examples=["/path/to/embedding/model"]
+    )
+    output: TradenameSegmentMapperOutputConfig = Field(
+        description="出力設定"
+    )
+    data_processing: TradenameSegmentMapperDataProcessingConfig = Field(
+        description="データ処理設定"
+    )
+    search_mapping: TradenameSegmentMapperSearchMappingConfig = Field(
+        description="検索・マッピング設定"
+    )
+    parallel_processing: TradenameSegmentMapperParallelProcessingConfig = Field(
+        description="並列処理設定"
+    )
 
 
 class GPPMConfig(BaseSettings):
@@ -303,9 +423,25 @@ class GPPMConfig(BaseSettings):
         examples=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     
+    # CSV処理設定
+    csv_processing: CSVProcessingConfig = Field(
+        description="CSV処理設定"
+    )
+    
+    # プロダクトレベル設定
+    product_level: ProductLevelConfig = Field(
+        description="プロダクトレベル設定"
+    )
+    
     # オプションデータ設定
     optional_data: OptionalDataConfig = Field(
         description="オプションデータ設定"
+    )
+    
+    # Tradename Segment Mapper設定
+    tradename_segment_mapper: Optional[TradenameSegmentMapperConfig] = Field(
+        default=None,
+        description="Tradename Segment Mapper設定"
     )
     
     @field_validator('log_level')
@@ -402,13 +538,6 @@ class GPPMConfig(BaseSettings):
         else:
             results['mapping_file'] = True  # オプショナルなので存在しなくてもOK
         
-        # 既存の変分推論結果ファイルの確認
-        if self.variational_inference.existing_result_path:
-            existing_path = Path(self.variational_inference.existing_result_path)
-            results['existing_result_file'] = existing_path.exists()
-        else:
-            results['existing_result_file'] = True  # オプショナルなので存在しなくてもOK
-        
         return results
     
     def setup_logging(self) -> None:
@@ -427,7 +556,7 @@ class GPPMConfig(BaseSettings):
         
         # フォーマッター
         formatter = logging.Formatter(
-            fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            fmt="%(asctime)s - %(levelname)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S"
         )
         
