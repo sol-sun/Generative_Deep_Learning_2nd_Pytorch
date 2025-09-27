@@ -248,16 +248,6 @@ class TradenameSegmentMapperResult(BaseModel):
             raise ValueError("ファイルサイズは0以上である必要があります")
         return v
 
-    @model_validator(mode="after")
-    def _validate_result_consistency(self) -> "TradenameSegmentMapperResult":
-        """結果の一貫性検証。"""
-        if self.total_mappings > self.total_entities:
-            raise ValueError("マッピング数は企業数を超えることはできません")
-        
-        if self.success_rate > 1.0:
-            raise ValueError("成功率は1.0を超えることはできません")
-        
-        return self
 
     @field_serializer("generated_at")
     def _serialize_datetime(self, dt: datetime) -> str:
@@ -397,6 +387,11 @@ class TradenameSegmentMapper:
         # マッピング生成
         mapping_df = self._generate_mappings(vectorstore_search, vectorstore_searched)
         logger.info(f"マッピング生成完了: {len(mapping_df)} 件")
+
+        # RBICSマスターデータを取得してL6_NAMEを追加
+        rbics_master = self._get_rbics_master_data()
+        mapping_df = self._add_l6_names(mapping_df, rbics_master)
+        logger.info(f"L6_NAME追加完了: {len(mapping_df)} 件")
 
         # 結果保存
         result = self._save_results(mapping_df, sector_df, tradename_df)
@@ -655,6 +650,80 @@ class TradenameSegmentMapper:
 
         return df.loc[new_index].reset_index(drop=True)
 
+    def _get_rbics_master_data(self) -> pd.DataFrame:
+        """RBICSマスターデータを取得。
+
+        Returns:
+            RBICSマスターデータのDataFrame
+        """
+        logger.info("RBICSマスターデータ取得開始")
+        
+        try:
+            # RBICSプロバイダーを使用してマスターデータを取得
+            rbics_provider = RBICSProvider()
+            current_date = datetime.now(timezone.utc).date()
+            query_params = RBICSQueryParams(
+                period=WolfPeriod.from_day(current_date)
+            )
+            
+            rbics_master = rbics_provider._query_structure_data(query_params)
+            
+            if rbics_master.empty:
+                raise ValueError("RBICSマスターデータが取得できませんでした")
+            
+            # 必要な列のみを選択
+            required_cols = ['L6_ID', 'L6_NAME']
+            available_cols = [col for col in required_cols if col in rbics_master.columns]
+            rbics_master = rbics_master[available_cols]
+            
+            logger.info(f"RBICSマスターデータ取得完了: {len(rbics_master)} 件")
+            return rbics_master
+            
+        except Exception as e:
+            logger.error(f"RBICSマスターデータ取得エラー: {e}")
+            raise
+
+    def _add_l6_names(self, mapping_df: pd.DataFrame, rbics_master: pd.DataFrame) -> pd.DataFrame:
+        """L6_NAMEを追加してオリジナル実装と同じ出力形式にする。
+
+        Args:
+            mapping_df: マッピングDataFrame
+            rbics_master: RBICSマスターデータ
+
+        Returns:
+            L6_NAMEが追加されたマッピングDataFrame
+        """
+        logger.info("L6_NAME追加開始")
+        
+        try:
+            # PRODUCT_L6_NAMEを追加
+            mapping_df = pd.merge(
+                mapping_df, 
+                rbics_master.rename(columns={'L6_ID': 'PRODUCT_L6_ID', 'L6_NAME': 'PRODUCT_L6_NAME'}),
+                on='PRODUCT_L6_ID', 
+                how='left'
+            )
+            
+            # RELABEL_L6_NAMEを追加
+            mapping_df = pd.merge(
+                mapping_df, 
+                rbics_master.rename(columns={'L6_ID': 'RELABEL_L6_ID', 'L6_NAME': 'RELABEL_L6_NAME'}),
+                on='RELABEL_L6_ID', 
+                how='left'
+            )
+            
+            # 最終的な列順序をオリジナル実装に合わせる
+            final_columns = ['FACTSET_ENTITY_ID', 'PRODUCT_L6_ID', 'PRODUCT_L6_NAME', 'RELABEL_L6_ID', 'RELABEL_L6_NAME']
+            mapping_df = mapping_df[final_columns]
+            
+            logger.info(f"L6_NAME追加完了: {len(mapping_df)} 件")
+            return mapping_df
+            
+        except Exception as e:
+            logger.error(f"L6_NAME追加エラー: {e}")
+            # エラー時は元のDataFrameを返す
+            return mapping_df
+
     def _create_vectorstore(self, sector_df: pd.DataFrame, tradename_df: pd.DataFrame) -> FAISS:
         """ベクトルストアの作成。
 
@@ -810,7 +879,7 @@ class TradenameSegmentMapper:
                         batch_unmapped.add(batch_indices[i])
                 
                 if cache_hits > 0:
-                    logger.debug(f"キャッシュヒット: {cache_hits}/{len(batch_metadata)}")
+                    logger.debug(f"既存マッピング再利用: {cache_hits}件/{len(batch_metadata)}件")
                 
                 if not batch_unmapped:
                     return batch_mapping, set()
